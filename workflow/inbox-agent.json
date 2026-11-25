@@ -1,0 +1,865 @@
+{
+  "name": "Shared inbox agent (orders@)",
+  "nodes": [
+    {
+      "id": "gmail-trigger",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "labelIds": [
+            "INBOX"
+          ]
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL",
+          "name": "Shared inbox"
+        }
+      }
+    },
+    {
+      "id": "read-orders-sheet",
+      "name": "Read Orders sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ORDERS_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Orders"
+        }
+      },
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "SHEETS",
+          "name": "Ops sheets"
+        }
+      }
+    },
+    {
+      "id": "normalize",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- src/core.js (generated, edit there) ----\n// Decision logic for the shared-inbox workflow. The same file is pasted into the\n// n8n Code nodes (workflow/build.py), run by the replay harness, and used by the\n// live demo, so what you test is what runs in n8n.\n//\n// The model classifies and extracts; this code decides. Nothing here sends mail:\n// replies are only ever saved as drafts for a person to approve.\n\nconst CARD = /\\b(?:\\d[ -]?){13,19}\\b/g;\nconst IBAN = /\\b[A-Z]{2}\\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\\b/g;\nconst PO_RE = /^PO-\\d{4}-\\d{4}$/;\n\nfunction domainOf(from) {\n  const m = String(from).match(/<([^>]+)>/);\n  const addr = (m ? m[1] : String(from)).trim().toLowerCase();\n  return { address: addr, local: addr.split(\"@\")[0], domain: addr.split(\"@\")[1] || \"\" };\n}\n\nfunction luhn(digits) {\n  let sum = 0, alt = false;\n  for (let i = digits.length - 1; i >= 0; i--) {\n    let n = +digits[i];\n    if (alt) { n *= 2; if (n > 9) n -= 9; }\n    sum += n; alt = !alt;\n  }\n  return sum % 10 === 0;\n}\n\n// Card numbers (Luhn-valid) and IBANs never reach the model or a sheet.\nfunction redact(text) {\n  const found = [];\n  let out = String(text || \"\").replace(CARD, (m) => {\n    const d = m.replace(/\\D/g, \"\");\n    if (d.length >= 13 && luhn(d)) { found.push(\"card number\"); return \"[card number removed]\"; }\n    return m;\n  });\n  out = out.replace(IBAN, () => { found.push(\"bank account\"); return \"[bank account removed]\"; });\n  return { text: out, found: Array.from(new Set(found)) };\n}\n\nfunction normalize(email) {\n  const sender = domainOf(email.from);\n  const body = redact(email.text);\n  const att = (email.attachments || []).map((a) => ({ name: a.name, text: redact(a.text).text }));\n  return {\n    id: email.id, message_id: email.message_id, subject: email.subject, received: email.received,\n    from: email.from, sender: sender.address, local: sender.local, domain: sender.domain,\n    headers: email.headers || {}, text: body.text, redacted: body.found, attachments: att,\n  };\n}\n\n// Lookalike domains: same as a known one after undoing common swaps, but not identical.\nfunction skeleton(d) {\n  return d.toLowerCase().replace(/rn/g, \"m\").replace(/vv/g, \"w\").replace(/[1|]/g, \"l\").replace(/0/g, \"o\").replace(/5/g, \"s\");\n}\nfunction editDistance(a, b) {\n  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i].concat(new Array(b.length).fill(0)));\n  for (let j = 1; j <= b.length; j++) dp[0][j] = j;\n  for (let i = 1; i <= a.length; i++)\n    for (let j = 1; j <= b.length; j++)\n      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));\n  return dp[a.length][b.length];\n}\nfunction lookalike(domain, known) {\n  if (known.indexOf(domain) >= 0) return null;\n  for (const k of known) {\n    if (skeleton(k) === skeleton(domain) || editDistance(k, domain) <= 2) return k;\n  }\n  return null;\n}\n\n// Before any model call: loops, bulk mail, duplicates, lookalikes.\nfunction prescreen(msg, seen, world) {\n  const h = Object.keys(msg.headers).reduce((o, k) => { o[k.toLowerCase()] = String(msg.headers[k]).toLowerCase(); return o; }, {});\n  if (seen.indexOf(msg.message_id) >= 0) return { action: \"ignore\", reason: \"same Message-ID already processed (trigger delivered it twice)\" };\n  if ((h[\"auto-submitted\"] && h[\"auto-submitted\"] !== \"no\") || /^(automatic reply|auto:|out of office)/i.test(msg.subject))\n    return { action: \"ignore\", reason: \"automatic reply; answering it could start a mail loop\" };\n  if (h[\"list-unsubscribe\"] || h[\"precedence\"] === \"bulk\")\n    return { action: world.settings.archive_newsletters ? \"archive\" : \"ignore\", reason: \"newsletter or bulk mail\" };\n  const known = Object.keys(world.customers).concat(world.suppliers);\n  const like = lookalike(msg.domain, known);\n  if (like) return { action: \"continue\", flag: \"lookalike\", reason: \"sender domain \" + msg.domain + \" imitates \" + like };\n  return { action: \"continue\" };\n}\n\nfunction money(n) { return Math.round(n * 100) / 100; }\nfunction fmt(n) { return money(n).toFixed(2); }\n\nfunction validateLines(lines, world, needPrice) {\n  const issues = [];\n  (lines || []).forEach((l) => {\n    const p = world.products[l.sku];\n    if (!p) { issues.push(\"unknown product \" + l.sku); return; }\n    if (!(Number.isInteger(l.qty) && l.qty > 0)) issues.push(\"bad quantity for \" + l.sku);\n    if (needPrice && l.unit_price != null && money(l.unit_price) !== money(p.price))\n      issues.push(l.sku + \" at EUR \" + fmt(l.unit_price) + \" but the price list says EUR \" + fmt(p.price));\n  });\n  if (!lines || !lines.length) issues.push(\"no order lines found\");\n  return issues;\n}\n\nfunction priced(lines, world) {\n  return lines.map((l) => {\n    const p = world.products[l.sku];\n    return { sku: l.sku, name: p ? p.name : l.sku, qty: l.qty, unit_price: p ? p.price : null, line_total: p ? money(p.price * l.qty) : null };\n  });\n}\n\n// Every number and date in a reply must come from the facts code allowed;\n// discounts, guarantees and delivery promises are never left to the model.\nfunction checkReply(text, facts) {\n  if (!text) return \"no draft\";\n  const banned = [[/\\b\\d+ ?% ?(off|discount)\\b|\\bdiscount\\b/i, \"offers a discount\"], [/\\bguarantee/i, \"makes a guarantee\"],\n    [/\\bship (it )?today\\b|\\bwill arrive\\b|\\barrive (on|by)?\\s*(mon|tue|wed|thu|fri|sat|sun)/i, \"promises a delivery date\"]];\n  for (const [re, why] of banned) if (re.test(text)) return why;\n  const allowed = new Set();\n  facts.forEach((f) => String(f).replace(/,/g, \"\").match(/\\d+(?:\\.\\d+)?/g)?.forEach((n) => allowed.add(String(+n))));\n  const nums = (text.replace(/,/g, \"\").match(/\\d+(?:\\.\\d+)?/g) || []).map((n) => String(+n));\n  const stray = nums.filter((n) => !allowed.has(n));\n  if (stray.length) return \"states \" + Array.from(new Set(stray)).join(\", \") + \", which is not in the order data\";\n  return null;\n}\n\nfunction approver(amount, world) { return amount != null && amount > world.settings.lead_approval_over ? \"lead\" : \"agent\"; }\n\n// The model's reading of the email -> what the workflow does.\nfunction decide(msg, screen, model, ctx, world) {\n  const s = world.settings;\n  const out = { id: msg.id, route: \"review\", issues: [], flags: [], actions: [], draft: null };\n  if (msg.redacted.length) out.flags.push(\"removed \" + msg.redacted.join(\" and \") + \" before the model saw it\");\n  if (screen.flag === \"lookalike\") { out.flags.push(screen.reason); out.issues.push(\"possible spoofed sender\"); }\n  if (!model || model.error) { out.route = \"error\"; out.issues.push(model ? model.error : \"no model result\"); return out; }\n  out.type = model.type; out.confidence = model.confidence; out.summary = model.summary;\n  if (model.confidence < s.confidence_threshold) { out.issues.push(\"model unsure (\" + model.confidence + \")\"); }\n  const f = model.fields || {}, customer = world.customers[msg.domain];\n  const isSystem = /^(no-?reply|mailer-daemon|notifications?)$/.test(msg.local);\n  let facts = [], amount = null;\n\n  if (model.type === \"purchase_order\") {\n    if (!f.po_number || !PO_RE.test(f.po_number)) out.issues.push(\"no valid PO number\");\n    if (!customer) out.issues.push(\"sender is not a known customer\");\n    out.issues = out.issues.concat(validateLines(f.lines, world, true));\n    const sum = money((f.lines || []).reduce((t, l) => t + (l.unit_price || 0) * l.qty, 0));\n    if (f.total != null && money(f.total) !== sum) out.issues.push(\"PO total EUR \" + fmt(f.total) + \" does not match the lines (EUR \" + fmt(sum) + \")\");\n    const dup = f.po_number && ctx.orders.some((o) => o.po === f.po_number);\n    amount = f.total;\n    out.record = { sheet: \"Orders\", key: f.po_number, row: { po: f.po_number, customer: customer ? customer.name : msg.domain, total: f.total, lines: (f.lines || []).length, requested: f.requested_date || \"\", status: \"New\", source: msg.message_id } };\n    if (!out.issues.length) {\n      out.route = \"orders\";\n      if (dup) { out.flags.push(\"PO already in the Orders sheet; row updated, no second confirmation\"); out.duplicate = true; }\n      facts = [f.po_number, (f.lines || []).length, fmt(f.total), f.requested_date || \"\", f.ship_to || \"\"];\n    }\n  } else if (model.type === \"quote_request\") {\n    out.issues = out.issues.concat(validateLines(f.lines, world, false));\n    if (!out.issues.length) {\n      const lines = priced(f.lines, world);\n      amount = money(lines.reduce((t, l) => t + l.line_total, 0));\n      out.route = \"quotes\";\n      out.record = { system: \"HubSpot\", object: \"deal\", key: msg.message_id, row: { name: (customer ? customer.name : msg.sender) + \" quote\", amount: amount, stage: \"Quote requested\", company: customer ? customer.hubspot_id : \"new contact: \" + msg.sender, lines: lines } };\n      if (f.customer_ask) out.flags.push(\"customer asks for \" + f.customer_ask + \"; a person decides\");\n      facts = lines.map((l) => l.qty).concat(lines.map((l) => fmt(l.unit_price)), lines.map((l) => l.name), [fmt(amount)]);\n    }\n  } else if (model.type === \"support\") {\n    const prio = f.issue === \"damaged\" || f.issue === \"wrong_item\" ? \"high\" : \"normal\";\n    out.route = \"support\";\n    out.record = { system: \"Helpdesk\", object: \"ticket\", key: msg.message_id, row: { subject: msg.subject, requester: msg.sender, po: f.po_number || \"\", issue: f.issue, priority: prio } };\n    facts = [f.po_number || \"\"];\n  } else if (model.type === \"order_status\") {\n    const o = ctx.orders.find((r) => r.po === f.po_number);\n    out.route = \"status\";\n    out.lookup = o || null;\n    if (!o) { out.route = \"review\"; out.issues.push(f.po_number + \" is not in the Orders sheet\"); }\n    else facts = [o.po, o.status, o.shipped || \"\", o.carrier || \"\", o.tracking || \"\"];\n  } else if (model.type === \"invoice\") {\n    out.route = \"accounts\";\n    out.record = { sheet: \"AP inbox\", key: f.invoice_number, row: { invoice: f.invoice_number, supplier: msg.domain, amount: f.amount, due: f.due } };\n  } else if (model.type === \"payment_change\") {\n    out.route = \"review\"; out.issues.push(\"asks to change payment details; verify by phone with a known contact\");\n  } else {\n    out.route = out.issues.length ? \"review\" : \"done\";\n    if (!out.issues.length) out.flags.push(\"nothing to do\");\n  }\n  if (out.issues.length) out.route = \"review\";\n\n  // Reply draft: only for routes that answer the customer, never to system senders.\n  const answers = { orders: 1, quotes: 1, support: 1, status: 1 };\n  if (answers[out.route] && !isSystem && !(out.duplicate)) {\n    const reason = checkReply(model.reply, facts);\n    const text = reason ? template(out, msg, f, world) : model.reply;\n    out.draft = { to: msg.sender, subject: \"Re: \" + msg.subject, text: text, by: reason ? \"template\" : \"model\", rejected: reason, approver: approver(amount, world), state: \"awaiting approval\" };\n  } else if (answers[out.route] && isSystem) {\n    out.flags.push(\"no reply: automated sender\");\n  }\n  return out;\n}\n\nfunction greeting(msg) {\n  const name = String(msg.from).split(\"<\")[0].trim().replace(/^Dr\\.\\s*/, \"\").split(\" \")[0];\n  return name && !/^(reception|accounts|polar)$/i.test(name) ? \"Hi \" + name + \",\" : \"Hello,\";\n}\n\n// Plain, safe replies built only from checked data.\nfunction template(out, msg, f, world) {\n  const g = greeting(msg);\n  if (out.route === \"orders\") return g + \" thank you for \" + f.po_number + \". We've logged it and will confirm dispatch by email.\";\n  if (out.route === \"quotes\") {\n    const r = out.record.row;\n    const lines = r.lines.map((l) => l.qty + \" x \" + l.name + \" at EUR \" + fmt(l.unit_price)).join(\"; \");\n    return g + \" here is your quote: \" + lines + \". Total EUR \" + fmt(r.amount) + \" excluding VAT. Reply to confirm and we'll book it in.\";\n  }\n  if (out.route === \"status\") {\n    const o = out.lookup;\n    return o.tracking ? g + \" \" + o.po + \" shipped on \" + o.shipped + \" with \" + o.carrier + \", tracking \" + o.tracking + \".\" : g + \" \" + o.po + (o.status === \"New\" ? \" has been received and is being prepared.\" : \" is at the \" + o.status.toLowerCase() + \" stage now.\") + \" We'll send tracking as soon as it ships.\";\n  }\n  if (out.route === \"support\") return g + \" thanks for letting us know. We've opened a ticket\" + (f.po_number ? \" for \" + f.po_number : \"\") + \" and will get back to you shortly.\";\n  return g + \" thanks for your email.\";\n}\n\nconst api = { normalize, redact, prescreen, lookalike, decide, checkReply, priced, template, domainOf };\nif (typeof module !== \"undefined\" && module.exports) module.exports = api;\nif (typeof window !== \"undefined\") window.InboxCore = api;\n\n// ---- node logic ----\n\n// Accepts the Gmail Trigger's output (simple: false) or the replay fixtures.\nreturn $('Gmail Trigger').all().map((item) => {\n  const j = item.json;\n  const email = j.from && j.from.text ? {\n    id: j.id, message_id: j.messageId, from: j.from.text, subject: j.subject, received: j.date,\n    text: j.text || '', headers: j.headers || {},\n    attachments: (j.attachmentTexts || []),\n  } : j;\n  return { json: normalize(email) };\n});\n"
+      }
+    },
+    {
+      "id": "pre-screen",
+      "name": "Pre-screen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- src/core.js (generated, edit there) ----\n// Decision logic for the shared-inbox workflow. The same file is pasted into the\n// n8n Code nodes (workflow/build.py), run by the replay harness, and used by the\n// live demo, so what you test is what runs in n8n.\n//\n// The model classifies and extracts; this code decides. Nothing here sends mail:\n// replies are only ever saved as drafts for a person to approve.\n\nconst CARD = /\\b(?:\\d[ -]?){13,19}\\b/g;\nconst IBAN = /\\b[A-Z]{2}\\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\\b/g;\nconst PO_RE = /^PO-\\d{4}-\\d{4}$/;\n\nfunction domainOf(from) {\n  const m = String(from).match(/<([^>]+)>/);\n  const addr = (m ? m[1] : String(from)).trim().toLowerCase();\n  return { address: addr, local: addr.split(\"@\")[0], domain: addr.split(\"@\")[1] || \"\" };\n}\n\nfunction luhn(digits) {\n  let sum = 0, alt = false;\n  for (let i = digits.length - 1; i >= 0; i--) {\n    let n = +digits[i];\n    if (alt) { n *= 2; if (n > 9) n -= 9; }\n    sum += n; alt = !alt;\n  }\n  return sum % 10 === 0;\n}\n\n// Card numbers (Luhn-valid) and IBANs never reach the model or a sheet.\nfunction redact(text) {\n  const found = [];\n  let out = String(text || \"\").replace(CARD, (m) => {\n    const d = m.replace(/\\D/g, \"\");\n    if (d.length >= 13 && luhn(d)) { found.push(\"card number\"); return \"[card number removed]\"; }\n    return m;\n  });\n  out = out.replace(IBAN, () => { found.push(\"bank account\"); return \"[bank account removed]\"; });\n  return { text: out, found: Array.from(new Set(found)) };\n}\n\nfunction normalize(email) {\n  const sender = domainOf(email.from);\n  const body = redact(email.text);\n  const att = (email.attachments || []).map((a) => ({ name: a.name, text: redact(a.text).text }));\n  return {\n    id: email.id, message_id: email.message_id, subject: email.subject, received: email.received,\n    from: email.from, sender: sender.address, local: sender.local, domain: sender.domain,\n    headers: email.headers || {}, text: body.text, redacted: body.found, attachments: att,\n  };\n}\n\n// Lookalike domains: same as a known one after undoing common swaps, but not identical.\nfunction skeleton(d) {\n  return d.toLowerCase().replace(/rn/g, \"m\").replace(/vv/g, \"w\").replace(/[1|]/g, \"l\").replace(/0/g, \"o\").replace(/5/g, \"s\");\n}\nfunction editDistance(a, b) {\n  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i].concat(new Array(b.length).fill(0)));\n  for (let j = 1; j <= b.length; j++) dp[0][j] = j;\n  for (let i = 1; i <= a.length; i++)\n    for (let j = 1; j <= b.length; j++)\n      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));\n  return dp[a.length][b.length];\n}\nfunction lookalike(domain, known) {\n  if (known.indexOf(domain) >= 0) return null;\n  for (const k of known) {\n    if (skeleton(k) === skeleton(domain) || editDistance(k, domain) <= 2) return k;\n  }\n  return null;\n}\n\n// Before any model call: loops, bulk mail, duplicates, lookalikes.\nfunction prescreen(msg, seen, world) {\n  const h = Object.keys(msg.headers).reduce((o, k) => { o[k.toLowerCase()] = String(msg.headers[k]).toLowerCase(); return o; }, {});\n  if (seen.indexOf(msg.message_id) >= 0) return { action: \"ignore\", reason: \"same Message-ID already processed (trigger delivered it twice)\" };\n  if ((h[\"auto-submitted\"] && h[\"auto-submitted\"] !== \"no\") || /^(automatic reply|auto:|out of office)/i.test(msg.subject))\n    return { action: \"ignore\", reason: \"automatic reply; answering it could start a mail loop\" };\n  if (h[\"list-unsubscribe\"] || h[\"precedence\"] === \"bulk\")\n    return { action: world.settings.archive_newsletters ? \"archive\" : \"ignore\", reason: \"newsletter or bulk mail\" };\n  const known = Object.keys(world.customers).concat(world.suppliers);\n  const like = lookalike(msg.domain, known);\n  if (like) return { action: \"continue\", flag: \"lookalike\", reason: \"sender domain \" + msg.domain + \" imitates \" + like };\n  return { action: \"continue\" };\n}\n\nfunction money(n) { return Math.round(n * 100) / 100; }\nfunction fmt(n) { return money(n).toFixed(2); }\n\nfunction validateLines(lines, world, needPrice) {\n  const issues = [];\n  (lines || []).forEach((l) => {\n    const p = world.products[l.sku];\n    if (!p) { issues.push(\"unknown product \" + l.sku); return; }\n    if (!(Number.isInteger(l.qty) && l.qty > 0)) issues.push(\"bad quantity for \" + l.sku);\n    if (needPrice && l.unit_price != null && money(l.unit_price) !== money(p.price))\n      issues.push(l.sku + \" at EUR \" + fmt(l.unit_price) + \" but the price list says EUR \" + fmt(p.price));\n  });\n  if (!lines || !lines.length) issues.push(\"no order lines found\");\n  return issues;\n}\n\nfunction priced(lines, world) {\n  return lines.map((l) => {\n    const p = world.products[l.sku];\n    return { sku: l.sku, name: p ? p.name : l.sku, qty: l.qty, unit_price: p ? p.price : null, line_total: p ? money(p.price * l.qty) : null };\n  });\n}\n\n// Every number and date in a reply must come from the facts code allowed;\n// discounts, guarantees and delivery promises are never left to the model.\nfunction checkReply(text, facts) {\n  if (!text) return \"no draft\";\n  const banned = [[/\\b\\d+ ?% ?(off|discount)\\b|\\bdiscount\\b/i, \"offers a discount\"], [/\\bguarantee/i, \"makes a guarantee\"],\n    [/\\bship (it )?today\\b|\\bwill arrive\\b|\\barrive (on|by)?\\s*(mon|tue|wed|thu|fri|sat|sun)/i, \"promises a delivery date\"]];\n  for (const [re, why] of banned) if (re.test(text)) return why;\n  const allowed = new Set();\n  facts.forEach((f) => String(f).replace(/,/g, \"\").match(/\\d+(?:\\.\\d+)?/g)?.forEach((n) => allowed.add(String(+n))));\n  const nums = (text.replace(/,/g, \"\").match(/\\d+(?:\\.\\d+)?/g) || []).map((n) => String(+n));\n  const stray = nums.filter((n) => !allowed.has(n));\n  if (stray.length) return \"states \" + Array.from(new Set(stray)).join(\", \") + \", which is not in the order data\";\n  return null;\n}\n\nfunction approver(amount, world) { return amount != null && amount > world.settings.lead_approval_over ? \"lead\" : \"agent\"; }\n\n// The model's reading of the email -> what the workflow does.\nfunction decide(msg, screen, model, ctx, world) {\n  const s = world.settings;\n  const out = { id: msg.id, route: \"review\", issues: [], flags: [], actions: [], draft: null };\n  if (msg.redacted.length) out.flags.push(\"removed \" + msg.redacted.join(\" and \") + \" before the model saw it\");\n  if (screen.flag === \"lookalike\") { out.flags.push(screen.reason); out.issues.push(\"possible spoofed sender\"); }\n  if (!model || model.error) { out.route = \"error\"; out.issues.push(model ? model.error : \"no model result\"); return out; }\n  out.type = model.type; out.confidence = model.confidence; out.summary = model.summary;\n  if (model.confidence < s.confidence_threshold) { out.issues.push(\"model unsure (\" + model.confidence + \")\"); }\n  const f = model.fields || {}, customer = world.customers[msg.domain];\n  const isSystem = /^(no-?reply|mailer-daemon|notifications?)$/.test(msg.local);\n  let facts = [], amount = null;\n\n  if (model.type === \"purchase_order\") {\n    if (!f.po_number || !PO_RE.test(f.po_number)) out.issues.push(\"no valid PO number\");\n    if (!customer) out.issues.push(\"sender is not a known customer\");\n    out.issues = out.issues.concat(validateLines(f.lines, world, true));\n    const sum = money((f.lines || []).reduce((t, l) => t + (l.unit_price || 0) * l.qty, 0));\n    if (f.total != null && money(f.total) !== sum) out.issues.push(\"PO total EUR \" + fmt(f.total) + \" does not match the lines (EUR \" + fmt(sum) + \")\");\n    const dup = f.po_number && ctx.orders.some((o) => o.po === f.po_number);\n    amount = f.total;\n    out.record = { sheet: \"Orders\", key: f.po_number, row: { po: f.po_number, customer: customer ? customer.name : msg.domain, total: f.total, lines: (f.lines || []).length, requested: f.requested_date || \"\", status: \"New\", source: msg.message_id } };\n    if (!out.issues.length) {\n      out.route = \"orders\";\n      if (dup) { out.flags.push(\"PO already in the Orders sheet; row updated, no second confirmation\"); out.duplicate = true; }\n      facts = [f.po_number, (f.lines || []).length, fmt(f.total), f.requested_date || \"\", f.ship_to || \"\"];\n    }\n  } else if (model.type === \"quote_request\") {\n    out.issues = out.issues.concat(validateLines(f.lines, world, false));\n    if (!out.issues.length) {\n      const lines = priced(f.lines, world);\n      amount = money(lines.reduce((t, l) => t + l.line_total, 0));\n      out.route = \"quotes\";\n      out.record = { system: \"HubSpot\", object: \"deal\", key: msg.message_id, row: { name: (customer ? customer.name : msg.sender) + \" quote\", amount: amount, stage: \"Quote requested\", company: customer ? customer.hubspot_id : \"new contact: \" + msg.sender, lines: lines } };\n      if (f.customer_ask) out.flags.push(\"customer asks for \" + f.customer_ask + \"; a person decides\");\n      facts = lines.map((l) => l.qty).concat(lines.map((l) => fmt(l.unit_price)), lines.map((l) => l.name), [fmt(amount)]);\n    }\n  } else if (model.type === \"support\") {\n    const prio = f.issue === \"damaged\" || f.issue === \"wrong_item\" ? \"high\" : \"normal\";\n    out.route = \"support\";\n    out.record = { system: \"Helpdesk\", object: \"ticket\", key: msg.message_id, row: { subject: msg.subject, requester: msg.sender, po: f.po_number || \"\", issue: f.issue, priority: prio } };\n    facts = [f.po_number || \"\"];\n  } else if (model.type === \"order_status\") {\n    const o = ctx.orders.find((r) => r.po === f.po_number);\n    out.route = \"status\";\n    out.lookup = o || null;\n    if (!o) { out.route = \"review\"; out.issues.push(f.po_number + \" is not in the Orders sheet\"); }\n    else facts = [o.po, o.status, o.shipped || \"\", o.carrier || \"\", o.tracking || \"\"];\n  } else if (model.type === \"invoice\") {\n    out.route = \"accounts\";\n    out.record = { sheet: \"AP inbox\", key: f.invoice_number, row: { invoice: f.invoice_number, supplier: msg.domain, amount: f.amount, due: f.due } };\n  } else if (model.type === \"payment_change\") {\n    out.route = \"review\"; out.issues.push(\"asks to change payment details; verify by phone with a known contact\");\n  } else {\n    out.route = out.issues.length ? \"review\" : \"done\";\n    if (!out.issues.length) out.flags.push(\"nothing to do\");\n  }\n  if (out.issues.length) out.route = \"review\";\n\n  // Reply draft: only for routes that answer the customer, never to system senders.\n  const answers = { orders: 1, quotes: 1, support: 1, status: 1 };\n  if (answers[out.route] && !isSystem && !(out.duplicate)) {\n    const reason = checkReply(model.reply, facts);\n    const text = reason ? template(out, msg, f, world) : model.reply;\n    out.draft = { to: msg.sender, subject: \"Re: \" + msg.subject, text: text, by: reason ? \"template\" : \"model\", rejected: reason, approver: approver(amount, world), state: \"awaiting approval\" };\n  } else if (answers[out.route] && isSystem) {\n    out.flags.push(\"no reply: automated sender\");\n  }\n  return out;\n}\n\nfunction greeting(msg) {\n  const name = String(msg.from).split(\"<\")[0].trim().replace(/^Dr\\.\\s*/, \"\").split(\" \")[0];\n  return name && !/^(reception|accounts|polar)$/i.test(name) ? \"Hi \" + name + \",\" : \"Hello,\";\n}\n\n// Plain, safe replies built only from checked data.\nfunction template(out, msg, f, world) {\n  const g = greeting(msg);\n  if (out.route === \"orders\") return g + \" thank you for \" + f.po_number + \". We've logged it and will confirm dispatch by email.\";\n  if (out.route === \"quotes\") {\n    const r = out.record.row;\n    const lines = r.lines.map((l) => l.qty + \" x \" + l.name + \" at EUR \" + fmt(l.unit_price)).join(\"; \");\n    return g + \" here is your quote: \" + lines + \". Total EUR \" + fmt(r.amount) + \" excluding VAT. Reply to confirm and we'll book it in.\";\n  }\n  if (out.route === \"status\") {\n    const o = out.lookup;\n    return o.tracking ? g + \" \" + o.po + \" shipped on \" + o.shipped + \" with \" + o.carrier + \", tracking \" + o.tracking + \".\" : g + \" \" + o.po + (o.status === \"New\" ? \" has been received and is being prepared.\" : \" is at the \" + o.status.toLowerCase() + \" stage now.\") + \" We'll send tracking as soon as it ships.\";\n  }\n  if (out.route === \"support\") return g + \" thanks for letting us know. We've opened a ticket\" + (f.po_number ? \" for \" + f.po_number : \"\") + \" and will get back to you shortly.\";\n  return g + \" thanks for your email.\";\n}\n\nconst api = { normalize, redact, prescreen, lookalike, decide, checkReply, priced, template, domainOf };\nif (typeof module !== \"undefined\" && module.exports) module.exports = api;\nif (typeof window !== \"undefined\") window.InboxCore = api;\n\n// ---- node logic ----\nconst WORLD = {\n \"company\": \"Northvale Dental Supply\",\n \"customers\": {\n  \"brightsmile-dental.example\": {\n   \"name\": \"BrightSmile Dental\",\n   \"hubspot_id\": \"C-1001\",\n   \"terms\": \"Net 30\"\n  },\n  \"oakridge-ortho.example\": {\n   \"name\": \"Oakridge Orthodontics\",\n   \"hubspot_id\": \"C-1002\",\n   \"terms\": \"Net 30\"\n  },\n  \"lakeside-clinic.example\": {\n   \"name\": \"Lakeside Family Clinic\",\n   \"hubspot_id\": \"C-1003\",\n   \"terms\": \"Net 15\"\n  },\n  \"cedar-family-dental.example\": {\n   \"name\": \"Cedar Family Dental\",\n   \"hubspot_id\": \"C-1004\",\n   \"terms\": \"Prepaid\"\n  }\n },\n \"suppliers\": [\n  \"medline-wholesale.example\",\n  \"polar-logistics.example\"\n ],\n \"products\": {\n  \"GLV-NIT-M\": {\n   \"name\": \"Nitrile gloves, medium, box of 200\",\n   \"price\": 14.5\n  },\n  \"GLV-NIT-L\": {\n   \"name\": \"Nitrile gloves, large, box of 200\",\n   \"price\": 14.5\n  },\n  \"AUT-PCH-57\": {\n   \"name\": \"Autoclave pouches 57x130, pack of 200\",\n   \"price\": 9.8\n  },\n  \"MSK-L2-50\": {\n   \"name\": \"Level 2 masks, box of 50\",\n   \"price\": 11.2\n  },\n  \"BIB-2PLY-500\": {\n   \"name\": \"Patient bibs 2-ply, case of 500\",\n   \"price\": 32.0\n  },\n  \"SAL-EJ-100\": {\n   \"name\": \"Saliva ejectors, bag of 100\",\n   \"price\": 6.4\n  },\n  \"CMP-A2-4G\": {\n   \"name\": \"Composite A2 syringe 4 g\",\n   \"price\": 27.9\n  },\n  \"IMP-ALG-500\": {\n   \"name\": \"Alginate impression material 500 g\",\n   \"price\": 18.75\n  }\n },\n \"settings\": {\n  \"confidence_threshold\": 0.75,\n  \"lead_approval_over\": 500,\n  \"archive_newsletters\": true,\n  \"reply_from\": \"Northvale Customer Service\"\n }\n};\n\nconst state = $getWorkflowStaticData('global');\nstate.seen = state.seen || [];\nconst out = [];\nfor (const item of $input.all()) {\n  const msg = item.json;\n  const screen = prescreen(msg, state.seen, WORLD);\n  state.seen.push(msg.message_id);\n  if (state.seen.length > 5000) state.seen = state.seen.slice(-5000);\n  out.push({ json: Object.assign({}, msg, { screen }) });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "needs-the-model",
+      "name": "Needs the model?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.screen.action }}",
+              "rightValue": "continue",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "archive-or-skip",
+      "name": "Archive or skip",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        520
+      ],
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.id }}",
+        "labelIds": [
+          "Label_Skipped"
+        ]
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL",
+          "name": "Shared inbox"
+        }
+      }
+    },
+    {
+      "id": "claude-read-email",
+      "name": "Claude: read email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "server-side-fallback-2026-07-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-opus-5-5', max_tokens: 1200, system: \"You read one email sent to a dental supply distributor's shared inbox. Classify it as purchase_order, quote_request, support, order_status, invoice, payment_change or other, give a confidence from 0 to 1, extract the fields for that type exactly as written (never guess prices or dates), and draft a short, friendly reply that uses only facts in the email. Never offer discounts or promise delivery dates.\", output_config: { effort: 'low', format: { type: 'json_schema', schema: {\"type\": \"object\", \"additionalProperties\": false, \"required\": [\"type\", \"confidence\", \"summary\", \"fields\", \"reply\"], \"properties\": {\"type\": {\"enum\": [\"purchase_order\", \"quote_request\", \"support\", \"order_status\", \"invoice\", \"payment_change\", \"other\"]}, \"confidence\": {\"type\": \"number\"}, \"summary\": {\"type\": \"string\"}, \"fields\": {\"type\": \"object\"}, \"reply\": {\"type\": [\"string\", \"null\"]}}} } }, messages: [{ role: 'user', content: 'From: ' + $json.from + '\\nSubject: ' + $json.subject + '\\n\\n' + $json.text + $json.attachments.map(a => '\\n\\n[Attachment ' + a.name + ']\\n' + a.text).join('') }] }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "ANTHROPIC",
+          "name": "Anthropic API key (x-api-key)"
+        }
+      }
+    },
+    {
+      "id": "decide",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// ---- src/core.js (generated, edit there) ----\n// Decision logic for the shared-inbox workflow. The same file is pasted into the\n// n8n Code nodes (workflow/build.py), run by the replay harness, and used by the\n// live demo, so what you test is what runs in n8n.\n//\n// The model classifies and extracts; this code decides. Nothing here sends mail:\n// replies are only ever saved as drafts for a person to approve.\n\nconst CARD = /\\b(?:\\d[ -]?){13,19}\\b/g;\nconst IBAN = /\\b[A-Z]{2}\\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\\b/g;\nconst PO_RE = /^PO-\\d{4}-\\d{4}$/;\n\nfunction domainOf(from) {\n  const m = String(from).match(/<([^>]+)>/);\n  const addr = (m ? m[1] : String(from)).trim().toLowerCase();\n  return { address: addr, local: addr.split(\"@\")[0], domain: addr.split(\"@\")[1] || \"\" };\n}\n\nfunction luhn(digits) {\n  let sum = 0, alt = false;\n  for (let i = digits.length - 1; i >= 0; i--) {\n    let n = +digits[i];\n    if (alt) { n *= 2; if (n > 9) n -= 9; }\n    sum += n; alt = !alt;\n  }\n  return sum % 10 === 0;\n}\n\n// Card numbers (Luhn-valid) and IBANs never reach the model or a sheet.\nfunction redact(text) {\n  const found = [];\n  let out = String(text || \"\").replace(CARD, (m) => {\n    const d = m.replace(/\\D/g, \"\");\n    if (d.length >= 13 && luhn(d)) { found.push(\"card number\"); return \"[card number removed]\"; }\n    return m;\n  });\n  out = out.replace(IBAN, () => { found.push(\"bank account\"); return \"[bank account removed]\"; });\n  return { text: out, found: Array.from(new Set(found)) };\n}\n\nfunction normalize(email) {\n  const sender = domainOf(email.from);\n  const body = redact(email.text);\n  const att = (email.attachments || []).map((a) => ({ name: a.name, text: redact(a.text).text }));\n  return {\n    id: email.id, message_id: email.message_id, subject: email.subject, received: email.received,\n    from: email.from, sender: sender.address, local: sender.local, domain: sender.domain,\n    headers: email.headers || {}, text: body.text, redacted: body.found, attachments: att,\n  };\n}\n\n// Lookalike domains: same as a known one after undoing common swaps, but not identical.\nfunction skeleton(d) {\n  return d.toLowerCase().replace(/rn/g, \"m\").replace(/vv/g, \"w\").replace(/[1|]/g, \"l\").replace(/0/g, \"o\").replace(/5/g, \"s\");\n}\nfunction editDistance(a, b) {\n  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i].concat(new Array(b.length).fill(0)));\n  for (let j = 1; j <= b.length; j++) dp[0][j] = j;\n  for (let i = 1; i <= a.length; i++)\n    for (let j = 1; j <= b.length; j++)\n      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));\n  return dp[a.length][b.length];\n}\nfunction lookalike(domain, known) {\n  if (known.indexOf(domain) >= 0) return null;\n  for (const k of known) {\n    if (skeleton(k) === skeleton(domain) || editDistance(k, domain) <= 2) return k;\n  }\n  return null;\n}\n\n// Before any model call: loops, bulk mail, duplicates, lookalikes.\nfunction prescreen(msg, seen, world) {\n  const h = Object.keys(msg.headers).reduce((o, k) => { o[k.toLowerCase()] = String(msg.headers[k]).toLowerCase(); return o; }, {});\n  if (seen.indexOf(msg.message_id) >= 0) return { action: \"ignore\", reason: \"same Message-ID already processed (trigger delivered it twice)\" };\n  if ((h[\"auto-submitted\"] && h[\"auto-submitted\"] !== \"no\") || /^(automatic reply|auto:|out of office)/i.test(msg.subject))\n    return { action: \"ignore\", reason: \"automatic reply; answering it could start a mail loop\" };\n  if (h[\"list-unsubscribe\"] || h[\"precedence\"] === \"bulk\")\n    return { action: world.settings.archive_newsletters ? \"archive\" : \"ignore\", reason: \"newsletter or bulk mail\" };\n  const known = Object.keys(world.customers).concat(world.suppliers);\n  const like = lookalike(msg.domain, known);\n  if (like) return { action: \"continue\", flag: \"lookalike\", reason: \"sender domain \" + msg.domain + \" imitates \" + like };\n  return { action: \"continue\" };\n}\n\nfunction money(n) { return Math.round(n * 100) / 100; }\nfunction fmt(n) { return money(n).toFixed(2); }\n\nfunction validateLines(lines, world, needPrice) {\n  const issues = [];\n  (lines || []).forEach((l) => {\n    const p = world.products[l.sku];\n    if (!p) { issues.push(\"unknown product \" + l.sku); return; }\n    if (!(Number.isInteger(l.qty) && l.qty > 0)) issues.push(\"bad quantity for \" + l.sku);\n    if (needPrice && l.unit_price != null && money(l.unit_price) !== money(p.price))\n      issues.push(l.sku + \" at EUR \" + fmt(l.unit_price) + \" but the price list says EUR \" + fmt(p.price));\n  });\n  if (!lines || !lines.length) issues.push(\"no order lines found\");\n  return issues;\n}\n\nfunction priced(lines, world) {\n  return lines.map((l) => {\n    const p = world.products[l.sku];\n    return { sku: l.sku, name: p ? p.name : l.sku, qty: l.qty, unit_price: p ? p.price : null, line_total: p ? money(p.price * l.qty) : null };\n  });\n}\n\n// Every number and date in a reply must come from the facts code allowed;\n// discounts, guarantees and delivery promises are never left to the model.\nfunction checkReply(text, facts) {\n  if (!text) return \"no draft\";\n  const banned = [[/\\b\\d+ ?% ?(off|discount)\\b|\\bdiscount\\b/i, \"offers a discount\"], [/\\bguarantee/i, \"makes a guarantee\"],\n    [/\\bship (it )?today\\b|\\bwill arrive\\b|\\barrive (on|by)?\\s*(mon|tue|wed|thu|fri|sat|sun)/i, \"promises a delivery date\"]];\n  for (const [re, why] of banned) if (re.test(text)) return why;\n  const allowed = new Set();\n  facts.forEach((f) => String(f).replace(/,/g, \"\").match(/\\d+(?:\\.\\d+)?/g)?.forEach((n) => allowed.add(String(+n))));\n  const nums = (text.replace(/,/g, \"\").match(/\\d+(?:\\.\\d+)?/g) || []).map((n) => String(+n));\n  const stray = nums.filter((n) => !allowed.has(n));\n  if (stray.length) return \"states \" + Array.from(new Set(stray)).join(\", \") + \", which is not in the order data\";\n  return null;\n}\n\nfunction approver(amount, world) { return amount != null && amount > world.settings.lead_approval_over ? \"lead\" : \"agent\"; }\n\n// The model's reading of the email -> what the workflow does.\nfunction decide(msg, screen, model, ctx, world) {\n  const s = world.settings;\n  const out = { id: msg.id, route: \"review\", issues: [], flags: [], actions: [], draft: null };\n  if (msg.redacted.length) out.flags.push(\"removed \" + msg.redacted.join(\" and \") + \" before the model saw it\");\n  if (screen.flag === \"lookalike\") { out.flags.push(screen.reason); out.issues.push(\"possible spoofed sender\"); }\n  if (!model || model.error) { out.route = \"error\"; out.issues.push(model ? model.error : \"no model result\"); return out; }\n  out.type = model.type; out.confidence = model.confidence; out.summary = model.summary;\n  if (model.confidence < s.confidence_threshold) { out.issues.push(\"model unsure (\" + model.confidence + \")\"); }\n  const f = model.fields || {}, customer = world.customers[msg.domain];\n  const isSystem = /^(no-?reply|mailer-daemon|notifications?)$/.test(msg.local);\n  let facts = [], amount = null;\n\n  if (model.type === \"purchase_order\") {\n    if (!f.po_number || !PO_RE.test(f.po_number)) out.issues.push(\"no valid PO number\");\n    if (!customer) out.issues.push(\"sender is not a known customer\");\n    out.issues = out.issues.concat(validateLines(f.lines, world, true));\n    const sum = money((f.lines || []).reduce((t, l) => t + (l.unit_price || 0) * l.qty, 0));\n    if (f.total != null && money(f.total) !== sum) out.issues.push(\"PO total EUR \" + fmt(f.total) + \" does not match the lines (EUR \" + fmt(sum) + \")\");\n    const dup = f.po_number && ctx.orders.some((o) => o.po === f.po_number);\n    amount = f.total;\n    out.record = { sheet: \"Orders\", key: f.po_number, row: { po: f.po_number, customer: customer ? customer.name : msg.domain, total: f.total, lines: (f.lines || []).length, requested: f.requested_date || \"\", status: \"New\", source: msg.message_id } };\n    if (!out.issues.length) {\n      out.route = \"orders\";\n      if (dup) { out.flags.push(\"PO already in the Orders sheet; row updated, no second confirmation\"); out.duplicate = true; }\n      facts = [f.po_number, (f.lines || []).length, fmt(f.total), f.requested_date || \"\", f.ship_to || \"\"];\n    }\n  } else if (model.type === \"quote_request\") {\n    out.issues = out.issues.concat(validateLines(f.lines, world, false));\n    if (!out.issues.length) {\n      const lines = priced(f.lines, world);\n      amount = money(lines.reduce((t, l) => t + l.line_total, 0));\n      out.route = \"quotes\";\n      out.record = { system: \"HubSpot\", object: \"deal\", key: msg.message_id, row: { name: (customer ? customer.name : msg.sender) + \" quote\", amount: amount, stage: \"Quote requested\", company: customer ? customer.hubspot_id : \"new contact: \" + msg.sender, lines: lines } };\n      if (f.customer_ask) out.flags.push(\"customer asks for \" + f.customer_ask + \"; a person decides\");\n      facts = lines.map((l) => l.qty).concat(lines.map((l) => fmt(l.unit_price)), lines.map((l) => l.name), [fmt(amount)]);\n    }\n  } else if (model.type === \"support\") {\n    const prio = f.issue === \"damaged\" || f.issue === \"wrong_item\" ? \"high\" : \"normal\";\n    out.route = \"support\";\n    out.record = { system: \"Helpdesk\", object: \"ticket\", key: msg.message_id, row: { subject: msg.subject, requester: msg.sender, po: f.po_number || \"\", issue: f.issue, priority: prio } };\n    facts = [f.po_number || \"\"];\n  } else if (model.type === \"order_status\") {\n    const o = ctx.orders.find((r) => r.po === f.po_number);\n    out.route = \"status\";\n    out.lookup = o || null;\n    if (!o) { out.route = \"review\"; out.issues.push(f.po_number + \" is not in the Orders sheet\"); }\n    else facts = [o.po, o.status, o.shipped || \"\", o.carrier || \"\", o.tracking || \"\"];\n  } else if (model.type === \"invoice\") {\n    out.route = \"accounts\";\n    out.record = { sheet: \"AP inbox\", key: f.invoice_number, row: { invoice: f.invoice_number, supplier: msg.domain, amount: f.amount, due: f.due } };\n  } else if (model.type === \"payment_change\") {\n    out.route = \"review\"; out.issues.push(\"asks to change payment details; verify by phone with a known contact\");\n  } else {\n    out.route = out.issues.length ? \"review\" : \"done\";\n    if (!out.issues.length) out.flags.push(\"nothing to do\");\n  }\n  if (out.issues.length) out.route = \"review\";\n\n  // Reply draft: only for routes that answer the customer, never to system senders.\n  const answers = { orders: 1, quotes: 1, support: 1, status: 1 };\n  if (answers[out.route] && !isSystem && !(out.duplicate)) {\n    const reason = checkReply(model.reply, facts);\n    const text = reason ? template(out, msg, f, world) : model.reply;\n    out.draft = { to: msg.sender, subject: \"Re: \" + msg.subject, text: text, by: reason ? \"template\" : \"model\", rejected: reason, approver: approver(amount, world), state: \"awaiting approval\" };\n  } else if (answers[out.route] && isSystem) {\n    out.flags.push(\"no reply: automated sender\");\n  }\n  return out;\n}\n\nfunction greeting(msg) {\n  const name = String(msg.from).split(\"<\")[0].trim().replace(/^Dr\\.\\s*/, \"\").split(\" \")[0];\n  return name && !/^(reception|accounts|polar)$/i.test(name) ? \"Hi \" + name + \",\" : \"Hello,\";\n}\n\n// Plain, safe replies built only from checked data.\nfunction template(out, msg, f, world) {\n  const g = greeting(msg);\n  if (out.route === \"orders\") return g + \" thank you for \" + f.po_number + \". We've logged it and will confirm dispatch by email.\";\n  if (out.route === \"quotes\") {\n    const r = out.record.row;\n    const lines = r.lines.map((l) => l.qty + \" x \" + l.name + \" at EUR \" + fmt(l.unit_price)).join(\"; \");\n    return g + \" here is your quote: \" + lines + \". Total EUR \" + fmt(r.amount) + \" excluding VAT. Reply to confirm and we'll book it in.\";\n  }\n  if (out.route === \"status\") {\n    const o = out.lookup;\n    return o.tracking ? g + \" \" + o.po + \" shipped on \" + o.shipped + \" with \" + o.carrier + \", tracking \" + o.tracking + \".\" : g + \" \" + o.po + (o.status === \"New\" ? \" has been received and is being prepared.\" : \" is at the \" + o.status.toLowerCase() + \" stage now.\") + \" We'll send tracking as soon as it ships.\";\n  }\n  if (out.route === \"support\") return g + \" thanks for letting us know. We've opened a ticket\" + (f.po_number ? \" for \" + f.po_number : \"\") + \" and will get back to you shortly.\";\n  return g + \" thanks for your email.\";\n}\n\nconst api = { normalize, redact, prescreen, lookalike, decide, checkReply, priced, template, domainOf };\nif (typeof module !== \"undefined\" && module.exports) module.exports = api;\nif (typeof window !== \"undefined\") window.InboxCore = api;\n\n// ---- node logic ----\nconst WORLD = {\n \"company\": \"Northvale Dental Supply\",\n \"customers\": {\n  \"brightsmile-dental.example\": {\n   \"name\": \"BrightSmile Dental\",\n   \"hubspot_id\": \"C-1001\",\n   \"terms\": \"Net 30\"\n  },\n  \"oakridge-ortho.example\": {\n   \"name\": \"Oakridge Orthodontics\",\n   \"hubspot_id\": \"C-1002\",\n   \"terms\": \"Net 30\"\n  },\n  \"lakeside-clinic.example\": {\n   \"name\": \"Lakeside Family Clinic\",\n   \"hubspot_id\": \"C-1003\",\n   \"terms\": \"Net 15\"\n  },\n  \"cedar-family-dental.example\": {\n   \"name\": \"Cedar Family Dental\",\n   \"hubspot_id\": \"C-1004\",\n   \"terms\": \"Prepaid\"\n  }\n },\n \"suppliers\": [\n  \"medline-wholesale.example\",\n  \"polar-logistics.example\"\n ],\n \"products\": {\n  \"GLV-NIT-M\": {\n   \"name\": \"Nitrile gloves, medium, box of 200\",\n   \"price\": 14.5\n  },\n  \"GLV-NIT-L\": {\n   \"name\": \"Nitrile gloves, large, box of 200\",\n   \"price\": 14.5\n  },\n  \"AUT-PCH-57\": {\n   \"name\": \"Autoclave pouches 57x130, pack of 200\",\n   \"price\": 9.8\n  },\n  \"MSK-L2-50\": {\n   \"name\": \"Level 2 masks, box of 50\",\n   \"price\": 11.2\n  },\n  \"BIB-2PLY-500\": {\n   \"name\": \"Patient bibs 2-ply, case of 500\",\n   \"price\": 32.0\n  },\n  \"SAL-EJ-100\": {\n   \"name\": \"Saliva ejectors, bag of 100\",\n   \"price\": 6.4\n  },\n  \"CMP-A2-4G\": {\n   \"name\": \"Composite A2 syringe 4 g\",\n   \"price\": 27.9\n  },\n  \"IMP-ALG-500\": {\n   \"name\": \"Alginate impression material 500 g\",\n   \"price\": 18.75\n  }\n },\n \"settings\": {\n  \"confidence_threshold\": 0.75,\n  \"lead_approval_over\": 500,\n  \"archive_newsletters\": true,\n  \"reply_from\": \"Northvale Customer Service\"\n }\n};\n\n// The sheet was read when this run started; POs logged earlier in the same run\n// are remembered too, so a PO resent minutes later is not confirmed twice.\nconst state = $getWorkflowStaticData('global');\nstate.pos = state.pos || [];\nconst sheet = $('Read Orders sheet').all().map((i) => i.json);\nreturn $input.all().map((item, i) => {\n  const orders = sheet.concat(state.pos.filter((p) => !sheet.some((r) => r.po === p.po)));\n  const msg = $('Pre-screen').itemMatching(i).json;\n  let model;\n  if (item.json.error) model = { error: String(item.json.error.message || item.json.error) };\n  else {\n    try { model = JSON.parse(item.json.content[0].text); }\n    catch (e) { model = { error: 'model reply was not valid JSON' }; }\n  }\n  const d = decide(msg, msg.screen, model, { orders }, WORLD);\n  if (d.route === 'orders' && !d.duplicate) state.pos.push({ po: d.record.key, status: 'New' });\n  return { json: Object.assign({ message_id: msg.message_id, sender: msg.sender, subject: msg.subject }, d) };\n});\n"
+      }
+    },
+    {
+      "id": "route",
+      "name": "Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "orders",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "orders"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "quotes",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "quotes"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "support",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "support"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "status",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "status"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "accounts",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "accounts"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "review",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "error"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "none"
+        }
+      }
+    },
+    {
+      "id": "orders-sheet-upsert",
+      "name": "Orders sheet: upsert",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1780,
+        0
+      ],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ORDERS_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Orders"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "po"
+          ],
+          "value": {
+            "po": "={{ $json.record.row.po }}",
+            "customer": "={{ $json.record.row.customer }}",
+            "total": "={{ $json.record.row.total }}",
+            "lines": "={{ $json.record.row.lines }}",
+            "requested": "={{ $json.record.row.requested }}",
+            "status": "={{ $json.record.row.status }}",
+            "source": "={{ $json.record.row.source }}"
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "SHEETS",
+          "name": "Ops sheets"
+        }
+      }
+    },
+    {
+      "id": "hubspot-create-deal",
+      "name": "HubSpot: create deal",
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.1,
+      "position": [
+        1780,
+        140
+      ],
+      "parameters": {
+        "resource": "deal",
+        "operation": "create",
+        "stage": "appointmentscheduled",
+        "additionalFields": {
+          "dealName": "={{ $json.record.row.name }}",
+          "amount": "={{ $json.record.row.amount }}"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "hubspotOAuth2Api": {
+          "id": "HUBSPOT",
+          "name": "HubSpot"
+        }
+      }
+    },
+    {
+      "id": "helpdesk-create-ticket",
+      "name": "Helpdesk: create ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1780,
+        280
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://helpdesk.example/api/tickets",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.record.row) }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "ap-inbox-append",
+      "name": "AP inbox: append",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1780,
+        560
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ORDERS_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "AP inbox"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoice": "={{ $json.record.row.invoice }}",
+            "supplier": "={{ $json.record.row.supplier }}",
+            "amount": "={{ $json.record.row.amount }}",
+            "due": "={{ $json.record.row.due }}"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "SHEETS",
+          "name": "Ops sheets"
+        }
+      }
+    },
+    {
+      "id": "review-queue-append",
+      "name": "Review queue: append",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1780,
+        700
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ORDERS_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Review"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message_id": "={{ $json.message_id }}",
+            "from": "={{ $json.sender }}",
+            "subject": "={{ $json.subject }}",
+            "why": "={{ $json.issues.join('; ') }}"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "SHEETS",
+          "name": "Ops sheets"
+        }
+      }
+    },
+    {
+      "id": "error-queue-append",
+      "name": "Error queue: append",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1780,
+        860
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "ORDERS_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Errors"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message_id": "={{ $json.message_id }}",
+            "error": "={{ $json.issues ? $json.issues.join('; ') : $json.error.message }}"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "SHEETS",
+          "name": "Ops sheets"
+        }
+      }
+    },
+    {
+      "id": "has-a-draft",
+      "name": "Has a draft?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2020,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.draft ? 'yes' : 'no' }}",
+              "rightValue": "yes",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "gmail-save-draft",
+      "name": "Gmail: save draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2240,
+        200
+      ],
+      "parameters": {
+        "resource": "draft",
+        "operation": "create",
+        "subject": "={{ $json.draft.subject }}",
+        "message": "={{ $json.draft.text }}",
+        "options": {
+          "sendTo": "={{ $json.draft.to }}",
+          "threadId": "={{ $json.message_id }}"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL",
+          "name": "Shared inbox"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Orders sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Orders sheet": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Pre-screen",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-screen": {
+      "main": [
+        [
+          {
+            "node": "Needs the model?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs the model?": {
+      "main": [
+        [
+          {
+            "node": "Claude: read email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Archive or skip",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: read email": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Orders sheet: upsert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HubSpot: create deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Helpdesk: create ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Has a draft?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AP inbox: append",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Review queue: append",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error queue: append",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Orders sheet: upsert": {
+      "main": [
+        [
+          {
+            "node": "Has a draft?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error queue: append",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: create deal": {
+      "main": [
+        [
+          {
+            "node": "Has a draft?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error queue: append",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Helpdesk: create ticket": {
+      "main": [
+        [
+          {
+            "node": "Has a draft?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error queue: append",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has a draft?": {
+      "main": [
+        [
+          {
+            "node": "Gmail: save draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Europe/Berlin"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "name": "inbox"
+    },
+    {
+      "name": "claude"
+    }
+  ]
+}

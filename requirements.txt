@@ -1,0 +1,2 @@
+# The harness needs only the standard library and Node.js 18+.
+pytest>=7

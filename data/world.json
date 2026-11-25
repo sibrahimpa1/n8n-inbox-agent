@@ -1,0 +1,38 @@
+{
+  "company": "Northvale Dental Supply",
+  "inbox": "orders@northvale-supply.example",
+  "now": "2026-11-25T09:00:00Z",
+  "users": {
+    "mia": {"name": "Mia Kovač", "role": "agent", "title": "Customer service"},
+    "tom": {"name": "Tom Haller", "role": "lead", "title": "Operations lead"}
+  },
+  "customers": {
+    "brightsmile-dental.example": {"name": "BrightSmile Dental", "hubspot_id": "C-1001", "terms": "Net 30"},
+    "oakridge-ortho.example": {"name": "Oakridge Orthodontics", "hubspot_id": "C-1002", "terms": "Net 30"},
+    "lakeside-clinic.example": {"name": "Lakeside Family Clinic", "hubspot_id": "C-1003", "terms": "Net 15"},
+    "cedar-family-dental.example": {"name": "Cedar Family Dental", "hubspot_id": "C-1004", "terms": "Prepaid"}
+  },
+  "suppliers": ["medline-wholesale.example", "polar-logistics.example"],
+  "products": {
+    "GLV-NIT-M": {"name": "Nitrile gloves, medium, box of 200", "price": 14.50},
+    "GLV-NIT-L": {"name": "Nitrile gloves, large, box of 200", "price": 14.50},
+    "AUT-PCH-57": {"name": "Autoclave pouches 57x130, pack of 200", "price": 9.80},
+    "MSK-L2-50": {"name": "Level 2 masks, box of 50", "price": 11.20},
+    "BIB-2PLY-500": {"name": "Patient bibs 2-ply, case of 500", "price": 32.00},
+    "SAL-EJ-100": {"name": "Saliva ejectors, bag of 100", "price": 6.40},
+    "CMP-A2-4G": {"name": "Composite A2 syringe 4 g", "price": 27.90},
+    "IMP-ALG-500": {"name": "Alginate impression material 500 g", "price": 18.75}
+  },
+  "orders_sheet": [
+    {"po": "PO-2026-1175", "customer": "Oakridge Orthodontics", "status": "Shipped", "shipped": "2026-11-21", "carrier": "Polar Logistics", "tracking": "PL7731940021"},
+    {"po": "PO-2026-1188", "customer": "Lakeside Family Clinic", "status": "Delivered", "shipped": "2026-11-18", "carrier": "Polar Logistics", "tracking": "PL7731940377"},
+    {"po": "PO-2026-1190", "customer": "Cedar Family Dental", "status": "Shipped", "shipped": "2026-11-22", "carrier": "Polar Logistics", "tracking": "PL7731941102"},
+    {"po": "PO-2026-1196", "customer": "BrightSmile Dental", "status": "Picking", "shipped": null, "carrier": null, "tracking": null}
+  ],
+  "settings": {
+    "confidence_threshold": 0.75,
+    "lead_approval_over": 500,
+    "archive_newsletters": true,
+    "reply_from": "Northvale Customer Service"
+  }
+}
