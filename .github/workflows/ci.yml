@@ -1,0 +1,41 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install -r requirements.txt
+      - name: Exported workflow is up to date
+        run: |
+          cp workflow/inbox-agent.json /tmp/committed.json
+          python -m harness build
+          diff -q /tmp/committed.json workflow/inbox-agent.json
+      - name: Tests (workflow replay, core rules, browser parity)
+        run: python -m pytest -q
+      - name: Evals
+        run: python -m harness eval
+      - name: Offline demo
+        run: python -m harness demo
+      - name: Live demo page is up to date
+        run: |
+          cp site/index.html /tmp/site.html
+          python -m harness site
+          diff -q /tmp/site.html site/index.html

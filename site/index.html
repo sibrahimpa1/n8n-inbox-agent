@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mailroom · shared inbox agent for n8n</title>
+<meta name="description" content="An n8n workflow that reads a shared inbox, extracts orders, quotes and support requests with Claude, routes them to Sheets, HubSpot and a helpdesk, and saves reply drafts for approval. Demo on synthetic data.">
+<style>:root{
+  --paper:#f6f4ef; --card:#fff; --ink:#1b1f24; --muted:#6a6f76; --line:#e2ded5; --soft:#eeebe3;
+  --teal:#0f5257; --teal2:#16696f; --teal-soft:#dcecec; --orange:#e8701a; --orange-soft:#fde8d6; --orange-ink:#8f3f05;
+  --plum:#6b2d5c; --plum-soft:#f1e2ec; --green:#2f7d4f; --green-soft:#dcefe3; --red:#b23a2b; --red-soft:#f7e0dc;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--paper);color:var(--ink);font:14px/1.5 var(--sans)}
+button{font:inherit;cursor:pointer}
+a{color:inherit}
+#banner{height:28px;display:flex;align-items:center;justify-content:center;gap:6px;background:var(--ink);color:#f6f4ef;font-size:12.5px}
+#banner a{color:#ffd2ab}
+#app{height:calc(100vh - 28px);display:flex;flex-direction:column}
+
+/* top bar */
+.top{display:flex;align-items:center;gap:18px;padding:0 20px;height:56px;background:var(--teal);color:#fff;flex:none}
+.brand{white-space:nowrap;display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.01em}
+.brand .stamp{width:30px;height:30px;border:2px dashed #ffd2ab;border-radius:6px;display:grid;place-items:center;font:700 13px var(--mono);color:#ffd2ab;transform:rotate(-6deg)}
+.brand small{display:block;font-weight:400;font-size:11.5px;opacity:.75}
+.tabs{display:flex;gap:2px;height:100%}
+.tabs a{white-space:nowrap;display:flex;align-items:center;gap:6px;padding:0 13px;text-decoration:none;color:#cfe3e3;border-bottom:3px solid transparent;font-weight:500}
+.tabs a:hover{color:#fff}
+.tabs a.on{color:#fff;border-bottom-color:var(--orange)}
+.tabs .n{background:var(--orange);color:#fff;border-radius:9px;font-size:11px;padding:0 6px;font-weight:700}
+.who{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:12.5px}
+.who select{background:#0b3f43;color:#fff;border:1px solid #2f7b80;border-radius:7px;padding:5px 8px;font:inherit}
+.body{flex:1;min-height:0;display:flex}
+
+/* inbox: three panes */
+.folders{width:200px;flex:none;border-right:1px solid var(--line);padding:14px 10px;overflow:auto;background:#faf9f5}
+.folders h4{margin:12px 8px 6px;font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.folders a{display:flex;align-items:center;gap:8px;padding:6px 9px;border-radius:7px;text-decoration:none}
+.folders a:hover{background:var(--soft)}
+.folders a.on{background:var(--teal-soft);color:var(--teal);font-weight:600}
+.folders .c{margin-left:auto;font:12px var(--mono);color:var(--muted)}
+.dot{width:9px;height:9px;border-radius:3px;flex:none;display:inline-block}
+.list{width:400px;flex:none;border-right:1px solid var(--line);overflow:auto;background:var(--card)}
+.list .row{display:block;text-decoration:none;padding:11px 14px;border-bottom:1px solid var(--line);border-left:3px solid transparent}
+.list .row:hover{background:#fbfaf6}
+.list .row.on{background:#f3f8f8;border-left-color:var(--teal)}
+.list .r1{display:flex;gap:8px;align-items:baseline}
+.list .from{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.list .time{margin-left:auto;font:12px var(--mono);color:var(--muted)}
+.list .subj{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.list .meta{display:flex;gap:6px;margin-top:5px;flex-wrap:wrap}
+.tag{display:inline-flex;align-items:center;gap:5px;border-radius:5px;padding:0 7px;font-size:11.5px;font-weight:600;line-height:20px}
+.t-orders{background:#dcecec;color:var(--teal)} .t-quotes{background:#e6e2f5;color:#4a3a8c} .t-support{background:var(--orange-soft);color:var(--orange-ink)}
+.t-status{background:#e2edf7;color:#2c5e8a} .t-accounts{background:#eee9db;color:#6b5a1f} .t-review{background:var(--plum-soft);color:var(--plum)}
+.t-error{background:var(--red-soft);color:var(--red)} .t-skipped,.t-archived,.t-done{background:var(--soft);color:var(--muted)}
+.t-draft{background:var(--green-soft);color:var(--green)} .t-flag{background:#fff3c4;color:#7a5b00}
+.read{flex:1;min-width:0;overflow:auto;padding:22px 28px 40px}
+.read h1{font-size:20px;margin:0 0 4px}
+.read .hdr{color:var(--muted);font-size:13px;margin-bottom:14px}
+.mail{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;white-space:pre-wrap;font-size:14px}
+.att{margin-top:8px;border:1px dashed var(--line);border-radius:8px;padding:8px 10px;font:12.5px/1.45 var(--mono);white-space:pre-wrap;background:#fbfaf6}
+.att b{font-family:var(--sans)}
+.sec{margin-top:20px}
+.sec h3{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 8px}
+.path{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.path a{font:12px var(--mono);text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:2px 8px}
+.path a:hover{border-color:var(--teal)}
+.path .arr{color:#b9b3a6}
+.path .retry{color:var(--orange-ink);font-size:11px}
+.facts{display:grid;grid-template-columns:150px 1fr;gap:4px 14px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-size:13.5px}
+.facts dt{color:var(--muted)} .facts dd{margin:0}
+.lines{width:100%;border-collapse:collapse;margin-top:6px;font-size:13px}
+.lines td,.lines th{padding:4px 8px;border-bottom:1px solid var(--line);text-align:left}
+.lines th{font-size:11px;color:var(--muted);text-transform:uppercase}
+.ok{color:var(--green);font-weight:700} .bad{color:var(--red);font-weight:700}
+.issue{background:var(--plum-soft);color:var(--plum);border-radius:8px;padding:8px 11px;margin-bottom:6px}
+.flag{background:#fff7d6;color:#6e5200;border-radius:8px;padding:8px 11px;margin-bottom:6px}
+.draft{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.draft .dh{display:flex;gap:10px;align-items:center;padding:9px 14px;background:#fbfaf6;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+.draft textarea{width:100%;border:0;padding:12px 14px;font:inherit;min-height:110px;resize:vertical;outline:none}
+.draft .why{padding:8px 14px;font-size:12.5px;background:var(--orange-soft);color:var(--orange-ink)}
+.draft .act{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--line);align-items:center;flex-wrap:wrap}
+.btn{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:6px 13px;font-weight:600;color:var(--ink)}
+.btn.go{background:var(--teal);border-color:var(--teal);color:#fff}
+.btn.warn{background:var(--orange);border-color:var(--orange);color:#fff}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.small{font-size:12.5px;color:var(--muted)}
+.empty{margin:80px auto;max-width:420px;text-align:center;color:var(--muted)}
+.empty h2{color:var(--ink);font-size:18px;margin:0 0 6px}
+
+/* pages */
+.page{flex:1;overflow:auto;padding:22px 28px 40px}
+.page h2{font-size:22px;margin:0 0 4px}
+.lede{color:var(--muted);margin:0 0 18px;max-width:820px}
+table.t{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+table.t th,table.t td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top}
+table.t th{background:var(--soft);font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}
+table.t tr.new td{background:#f4faf6}
+.subtabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.subtabs a{padding:5px 12px;border-radius:999px;border:1px solid var(--line);text-decoration:none;background:var(--card);font-size:13px}
+.subtabs a.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.card h4{margin:0 0 4px;font-size:15px}
+.tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:18px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.tile b{display:block;font:700 26px var(--mono)}
+.tile span{font-size:12px;color:var(--muted)}
+.tile.g b{color:var(--green)} .tile.o b{color:var(--orange-ink)}
+.set{display:grid;grid-template-columns:300px 1fr;gap:6px 24px;align-items:center;padding:14px 0;border-bottom:1px solid var(--line)}
+.set p{margin:2px 0 0;font-size:12.5px;color:var(--muted)}
+.lock{background:var(--plum-soft);color:var(--plum);border-radius:10px;padding:10px 14px;margin-bottom:12px}
+
+/* canvas */
+.canvas-wrap{flex:1;display:flex;min-height:0}
+.canvas{flex:1;overflow:auto;background-color:#f1efe8;background-image:radial-gradient(#d6d1c4 1px,transparent 1px);background-size:18px 18px;position:relative}
+.canvas svg{display:block}
+.nd rect{fill:#fff;stroke:#cfc9bb;stroke-width:1.5;rx:10}
+.nd.sel rect{stroke:var(--orange);stroke-width:2.5}
+.nd text{font:11px var(--sans);fill:var(--ink)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.canvas svg{margin-top:20px}
+.nd .ty{font:10.5px var(--mono);fill:var(--muted)}
+.nd .cnt{font:700 11px var(--mono);fill:#fff}
+.edge{fill:none;stroke:#a9a291;stroke-width:1.6}
+.edge.hot{stroke:var(--teal2);stroke-width:2.4}
+.insp{width:330px;flex:none;border-left:1px solid var(--line);background:var(--card);overflow:auto;padding:18px 20px}
+.insp h3{margin:0 0 4px}
+.kbd{font:11px var(--mono);background:var(--soft);border-radius:4px;padding:1px 5px;color:var(--muted)}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(20px);opacity:0;background:var(--ink);color:#fff;padding:9px 16px;border-radius:10px;transition:.2s;pointer-events:none;z-index:30}
+#toast.show{opacity:1;transform:translateX(-50%)}
+@media (max-width:1000px){.folders{display:none}.list{width:300px}.tiles{grid-template-columns:repeat(2,1fr)}.insp{width:320px}}
+@media (max-width:720px){.body{flex-direction:column}.list{width:auto;max-height:40vh}.tabs a{padding:0 7px;font-size:12.5px}.brand small{display:none}}
+</style>
+</head>
+<body>
+<div id="banner">Demo on synthetic data · Northvale Dental Supply is made up · <a href="https://github.com/sibrahimpa1/n8n-inbox-agent">Code and the importable n8n workflow on GitHub</a></div>
+<div id="app"></div>
+<div id="toast" role="status"></div>
+<script>window.MAILROOM = {"world":{"company":"Northvale Dental Supply","inbox":"orders@northvale-supply.example","now":"2026-11-25T09:00:00Z","users":{"mia":{"name":"Mia Kova\u010d","role":"agent","title":"Customer service"},"tom":{"name":"Tom Haller","role":"lead","title":"Operations lead"}},"customers":{"brightsmile-dental.example":{"name":"BrightSmile Dental","hubspot_id":"C-1001","terms":"Net 30"},"oakridge-ortho.example":{"name":"Oakridge Orthodontics","hubspot_id":"C-1002","terms":"Net 30"},"lakeside-clinic.example":{"name":"Lakeside Family Clinic","hubspot_id":"C-1003","terms":"Net 15"},"cedar-family-dental.example":{"name":"Cedar Family Dental","hubspot_id":"C-1004","terms":"Prepaid"}},"suppliers":["medline-wholesale.example","polar-logistics.example"],"products":{"GLV-NIT-M":{"name":"Nitrile gloves, medium, box of 200","price":14.5},"GLV-NIT-L":{"name":"Nitrile gloves, large, box of 200","price":14.5},"AUT-PCH-57":{"name":"Autoclave pouches 57x130, pack of 200","price":9.8},"MSK-L2-50":{"name":"Level 2 masks, box of 50","price":11.2},"BIB-2PLY-500":{"name":"Patient bibs 2-ply, case of 500","price":32.0},"SAL-EJ-100":{"name":"Saliva ejectors, bag of 100","price":6.4},"CMP-A2-4G":{"name":"Composite A2 syringe 4 g","price":27.9},"IMP-ALG-500":{"name":"Alginate impression material 500 g","price":18.75}},"orders_sheet":[{"po":"PO-2026-1175","customer":"Oakridge Orthodontics","status":"Shipped","shipped":"2026-11-21","carrier":"Polar Logistics","tracking":"PL7731940021"},{"po":"PO-2026-1188","customer":"Lakeside Family Clinic","status":"Delivered","shipped":"2026-11-18","carrier":"Polar Logistics","tracking":"PL7731940377"},{"po":"PO-2026-1190","customer":"Cedar Family Dental","status":"Shipped","shipped":"2026-11-22","carrier":"Polar Logistics","tracking":"PL7731941102"},{"po":"PO-2026-1196","customer":"BrightSmile Dental","status":"Picking","shipped":null,"carrier":null,"tracking":null}],"settings":{"confidence_threshold":0.75,"lead_approval_over":500,"archive_newsletters":true,"reply_from":"Northvale Customer Service"}},"emails":[{"id":"E-01","message_id":"<a1@brightsmile-dental.example>","from":"Hana Petrov <orders@brightsmile-dental.example>","subject":"PO-2026-1201 weekly restock","received":"2026-11-24T07:42:00Z","headers":{},"text":"Hi Northvale team,\n\nPlease find our PO-2026-1201 attached. Delivery to the Main Street practice by 28 November if possible.\n\nThanks,\nHana","attachments":[{"name":"PO-2026-1201.pdf","text":"PURCHASE ORDER PO-2026-1201\nBrightSmile Dental, 14 Main Street\nGLV-NIT-M  10 x 14.50 = 145.00\nAUT-PCH-57  6 x 9.80 = 58.80\nSAL-EJ-100  5 x 6.40 = 32.00\nTOTAL EUR 235.80\nRequested delivery: 2026-11-28"}]},{"id":"E-02","message_id":"<b2@oakridge-ortho.example>","from":"Luka Brandt <purchasing@oakridge-ortho.example>","subject":"Order PO-2026-1202","received":"2026-11-24T08:05:00Z","headers":{},"text":"Hello, new order attached, PO-2026-1202. Same prices as last time please.","attachments":[{"name":"PO-2026-1202.pdf","text":"PURCHASE ORDER PO-2026-1202\nOakridge Orthodontics\nCMP-A2-4G  4 x 24.90 = 99.60\nIMP-ALG-500  3 x 18.75 = 56.25\nTOTAL EUR 155.85"}]},{"id":"E-03","message_id":"<c3@brightsmi1e-dental.example>","from":"Hana Petrov <orders@brightsmi1e-dental.example>","subject":"Urgent PO-2026-1203, ship today","received":"2026-11-24T08:11:00Z","headers":{},"text":"Please ship this urgently to our new warehouse address in the attached PO. Payment to follow.","attachments":[{"name":"PO-2026-1203.pdf","text":"PURCHASE ORDER PO-2026-1203\nBrightSmile Dental, Unit 9 Dock Road\nGLV-NIT-L  80 x 14.50 = 1160.00\nTOTAL EUR 1160.00"}]},{"id":"E-04","message_id":"<a1-resend@brightsmile-dental.example>","from":"Hana Petrov <orders@brightsmile-dental.example>","subject":"Fwd: PO-2026-1201 weekly restock","received":"2026-11-24T08:20:00Z","headers":{},"text":"Resending in case the first one didn't come through.\n\n---------- Forwarded message ---------\nPlease find our PO-2026-1201 attached.","attachments":[{"name":"PO-2026-1201.pdf","text":"PURCHASE ORDER PO-2026-1201\nBrightSmile Dental, 14 Main Street\nGLV-NIT-M  10 x 14.50 = 145.00\nAUT-PCH-57  6 x 9.80 = 58.80\nSAL-EJ-100  5 x 6.40 = 32.00\nTOTAL EUR 235.80\nRequested delivery: 2026-11-28"}]},{"id":"E-05","message_id":"<b2@oakridge-ortho.example>","from":"Luka Brandt <purchasing@oakridge-ortho.example>","subject":"Order PO-2026-1202","received":"2026-11-24T08:05:00Z","headers":{},"text":"Hello, new order attached, PO-2026-1202. Same prices as last time please.","attachments":[],"note":"Gmail trigger delivered the same message twice"},{"id":"E-06","message_id":"<d6@lakeside-clinic.example>","from":"Dr. Amira Celik <amira@lakeside-clinic.example>","subject":"Quote for gloves and pouches","received":"2026-11-24T08:31:00Z","headers":{},"text":"Hi, could you quote 40 boxes of medium nitrile gloves and 10 packs of the 57x130 autoclave pouches? We'd like to order before the holidays.\n\nAmira","attachments":[]},{"id":"E-07","message_id":"<e7@gmail.example>","from":"Jonas Reiter <jonas.reiter.dds@gmail.example>","subject":"New practice, price list?","received":"2026-11-24T08:47:00Z","headers":{},"text":"Hello, I'm opening a two-chair practice in January. Could you quote 20 boxes of level 2 masks and 4 cases of patient bibs? Thanks, Jonas Reiter DDS","attachments":[]},{"id":"E-08","message_id":"<f8@lakeside-clinic.example>","from":"Reception <front@lakeside-clinic.example>","subject":"Damaged boxes in PO-2026-1188","received":"2026-11-24T09:02:00Z","headers":{},"text":"Two of the glove boxes from PO-2026-1188 arrived crushed and torn open. We can't use them for patients. Photos attached. What do we do?","attachments":[{"name":"photo1.jpg","text":""}]},{"id":"E-09","message_id":"<g9@cedar-family-dental.example>","from":"Mark Ivers <mark@cedar-family-dental.example>","subject":"WRONG ITEMS AGAIN","received":"2026-11-24T09:15:00Z","headers":{},"text":"This is the second time. We ordered large gloves on PO-2026-1190 and got medium. We have patients all day. I need the right ones TODAY.","attachments":[]},{"id":"E-10","message_id":"<h10@oakridge-ortho.example>","from":"Luka Brandt <purchasing@oakridge-ortho.example>","subject":"Alginate setting time question","received":"2026-11-24T09:26:00Z","headers":{},"text":"Quick one: what's the working time for the alginate you sent? Our assistants find it sets too fast.","attachments":[]},{"id":"E-11","message_id":"<i11@oakridge-ortho.example>","from":"Luka Brandt <purchasing@oakridge-ortho.example>","subject":"Where is PO-2026-1175?","received":"2026-11-24T09:40:00Z","headers":{},"text":"Hi, can you tell me where PO-2026-1175 is? We need it this week.","attachments":[]},{"id":"E-12","message_id":"<j12@brightsmile-dental.example>","from":"Hana Petrov <orders@brightsmile-dental.example>","subject":"Status PO-2026-1099","received":"2026-11-24T09:51:00Z","headers":{},"text":"Any update on PO-2026-1099?","attachments":[]},{"id":"E-13","message_id":"<k13@oakridge-ortho.example>","from":"Luka Brandt <purchasing@oakridge-ortho.example>","subject":"Automatic reply: Where is PO-2026-1175?","received":"2026-11-24T09:58:00Z","headers":{"Auto-Submitted":"auto-replied"},"text":"I am out of the office until 1 December with limited access to email.","attachments":[]},{"id":"E-14","message_id":"<l14@news.medline-wholesale.example>","from":"Medline Wholesale <news@medline-wholesale.example>","subject":"December promotions for distributors","received":"2026-11-24T10:05:00Z","headers":{"List-Unsubscribe":"<mailto:unsub@medline-wholesale.example>"},"text":"See this month's distributor promotions.","attachments":[]},{"id":"E-15","message_id":"<m15@medline-wholesale.example>","from":"Accounts <ar@medline-wholesale.example>","subject":"Invoice INV-88412","received":"2026-11-24T10:12:00Z","headers":{},"text":"Please find invoice INV-88412 for EUR 4,312.00 due 24 December attached.","attachments":[{"name":"INV-88412.pdf","text":"INVOICE INV-88412 TOTAL EUR 4312.00 DUE 2026-12-24"}]},{"id":"E-16","message_id":"<n16@cedar-family-dental.example>","from":"Mark Ivers <mark@cedar-family-dental.example>","subject":"Order + card","received":"2026-11-24T10:20:00Z","headers":{},"text":"Please send 10 boxes of large gloves. We're prepaid, so charge my card 4111 1111 1111 1111 exp 09/28.","attachments":[]},{"id":"E-17","message_id":"<o17@lakeside-clinic.example>","from":"Reception <front@lakeside-clinic.example>","subject":"see attached","received":"2026-11-24T10:33:00Z","headers":{},"text":"Hi, see attached.","attachments":[]},{"id":"E-18","message_id":"<p18@oakridge-ortho.example>","from":"Luka Brandt <purchasing@oakridge-ortho.example>","subject":"PO-2026-1204","received":"2026-11-24T10:41:00Z","headers":{},"text":"PO attached.","attachments":[{"name":"PO-2026-1204.pdf","text":"PURCHASE ORDER PO-2026-1204\nOakridge Orthodontics\nGLV-NIT-M  20 x 14.50 = 290.00\nMSK-L2-50  10 x 11.20 = 112.00\nBIB-2PLY-500  2 x 32.00 = 64.00\nTOTAL EUR 646.00"}]},{"id":"E-19","message_id":"<q19@cedar-family-dental.example>","from":"Mark Ivers <mark@cedar-family-dental.example>","subject":"re: re: re: gloves","received":"2026-11-24T10:50:00Z","headers":{},"text":"ok thanks","attachments":[]},{"id":"E-20","message_id":"<r20@lakeside-clinic.example>","from":"Dr. Amira Celik <amira@lakeside-clinic.example>","subject":"PO-2026-1205","received":"2026-11-24T11:02:00Z","headers":{},"text":"Order attached, thank you!","attachments":[{"name":"PO-2026-1205.pdf","text":"PURCHASE ORDER PO-2026-1205\nLakeside Family Clinic\nMSK-L2-50  6 x 11.20 = 67.20\nSAL-EJ-100  10 x 6.40 = 64.00\nTOTAL EUR 131.20"}]},{"id":"E-21","message_id":"<s21@polar-logistlcs.example>","from":"Polar Logistics Billing <billing@polar-logistlcs.example>","subject":"Updated bank details for payments","received":"2026-11-24T11:15:00Z","headers":{},"text":"Please note our bank details have changed. Update your records and send all future payments to IBAN DE00 1234 5678 9012 3456 78.","attachments":[]},{"id":"E-22","message_id":"<t22@polar-logistics.example>","from":"Polar Logistics <noreply@polar-logistics.example>","subject":"Delivery exception PL7731941102","received":"2026-11-24T11:22:00Z","headers":{},"text":"Delivery exception for shipment PL7731941102 (reference PO-2026-1190): recipient closed. A second attempt is scheduled.","attachments":[]},{"id":"E-23","message_id":"<u23@cedar-family-dental.example>","from":"Mark Ivers <mark@cedar-family-dental.example>","subject":"Quote: 30 composite syringes, 20% off?","received":"2026-11-24T11:35:00Z","headers":{},"text":"Can you quote 30 composite A2 syringes? Given the wrong-items mess I'd expect 20% off.","attachments":[]},{"id":"E-24","message_id":"<v24@lakeside-clinic.example>","from":"Dr. Amira Celik <amira@lakeside-clinic.example>","subject":"PO-2026-1206","received":"2026-11-24T11:48:00Z","headers":{},"text":"One more order attached.","attachments":[{"name":"PO-2026-1206.pdf","text":"PURCHASE ORDER PO-2026-1206\nLakeside Family Clinic\nGLV-NIT-L  12 x 14.50 = 174.00\nIMP-ALG-500  2 x 18.75 = 37.50\nTOTAL EUR 211.50"}]}],"recorded":{"E-01":{"type":"purchase_order","confidence":0.97,"summary":"Weekly restock PO with three lines.","fields":{"po_number":"PO-2026-1201","ship_to":"14 Main Street","requested_date":"2026-11-28","total":235.8,"lines":[{"sku":"GLV-NIT-M","qty":10,"unit_price":14.5},{"sku":"AUT-PCH-57","qty":6,"unit_price":9.8},{"sku":"SAL-EJ-100","qty":5,"unit_price":6.4}]},"reply":"Hi Hana, thank you for PO-2026-1201 (3 lines, EUR 235.80). We've logged it and will confirm dispatch for your requested date of 2026-11-28."},"E-02":{"type":"purchase_order","confidence":0.95,"summary":"PO with composite and alginate.","fields":{"po_number":"PO-2026-1202","ship_to":null,"requested_date":null,"total":155.85,"lines":[{"sku":"CMP-A2-4G","qty":4,"unit_price":24.9},{"sku":"IMP-ALG-500","qty":3,"unit_price":18.75}]},"reply":"Hi Luka, thanks for PO-2026-1202, total EUR 155.85. It's in the queue."},"E-03":{"type":"purchase_order","confidence":0.93,"summary":"Urgent PO to a new address.","fields":{"po_number":"PO-2026-1203","ship_to":"Unit 9 Dock Road","requested_date":null,"total":1160.0,"lines":[{"sku":"GLV-NIT-L","qty":80,"unit_price":14.5}]},"reply":"Hi Hana, PO-2026-1203 received; we'll ship today to Unit 9 Dock Road."},"E-04":{"type":"purchase_order","confidence":0.96,"summary":"Resent copy of PO-2026-1201.","fields":{"po_number":"PO-2026-1201","ship_to":"14 Main Street","requested_date":"2026-11-28","total":235.8,"lines":[{"sku":"GLV-NIT-M","qty":10,"unit_price":14.5},{"sku":"AUT-PCH-57","qty":6,"unit_price":9.8},{"sku":"SAL-EJ-100","qty":5,"unit_price":6.4}]},"reply":"Hi Hana, thank you for PO-2026-1201. We've logged it."},"E-06":{"type":"quote_request","confidence":0.94,"summary":"Quote for gloves and pouches.","fields":{"lines":[{"sku":"GLV-NIT-M","qty":40},{"sku":"AUT-PCH-57","qty":10}],"customer_ask":null},"reply":"Hi Amira, here is your quote: 40 x Nitrile gloves, medium at EUR 14.50 and 10 x Autoclave pouches at EUR 9.80, total EUR 678.00 excluding VAT. Reply to this email to confirm and we'll book it in before the holidays."},"E-07":{"type":"quote_request","confidence":0.9,"summary":"New practice asking for masks and bibs.","fields":{"lines":[{"sku":"MSK-L2-50","qty":20},{"sku":"BIB-2PLY-500","qty":4}],"customer_ask":null},"reply":"Hello Jonas, congratulations on the new practice. 20 x Level 2 masks at EUR 11.20 and 4 x Patient bibs at EUR 32.00 come to EUR 352.00 excluding VAT. We'd be glad to set up an account for you."},"E-08":{"type":"support","confidence":0.96,"summary":"Crushed glove boxes on delivery.","fields":{"po_number":"PO-2026-1188","issue":"damaged","urgency":"high"},"reply":"Hello, sorry the glove boxes from PO-2026-1188 arrived damaged. We've opened a ticket and will arrange replacements; you don't need to return the damaged boxes."},"E-09":{"type":"support","confidence":0.95,"summary":"Wrong glove size delivered again.","fields":{"po_number":"PO-2026-1190","issue":"wrong_item","urgency":"high"},"reply":"Hi Mark, I'm sorry we sent medium instead of large gloves on PO-2026-1190, and that it happened twice. We've opened an urgent ticket and someone from operations will contact you shortly."},"E-10":{"type":"support","confidence":0.88,"summary":"Product question about alginate working time.","fields":{"po_number":null,"issue":"product_question","urgency":"normal"},"reply":"Hi Luka, good question. I've passed it to our product specialist, who will reply with the working time and mixing tips."},"E-11":{"type":"order_status","confidence":0.97,"summary":"Asks where PO-2026-1175 is.","fields":{"po_number":"PO-2026-1175"},"reply":"Hi Luka, PO-2026-1175 shipped with Polar Logistics, tracking PL7731940021, and will arrive Thursday 26 November."},"E-12":{"type":"order_status","confidence":0.96,"summary":"Asks for status of PO-2026-1099.","fields":{"po_number":"PO-2026-1099"},"reply":"Hi Hana, PO-2026-1099 is on its way."},"E-15":{"type":"invoice","confidence":0.97,"summary":"Supplier invoice.","fields":{"invoice_number":"INV-88412","amount":4312.0,"due":"2026-12-24"},"reply":null},"E-16":{"type":"purchase_order","confidence":0.81,"summary":"Order for large gloves in the email body, no PO number.","fields":{"po_number":null,"ship_to":null,"requested_date":null,"total":null,"lines":[{"sku":"GLV-NIT-L","qty":10,"unit_price":null}]},"reply":"Hi Mark, thanks, we'll send 10 boxes of large gloves."},"E-17":{"type":"other","confidence":0.31,"summary":"Says see attached but nothing is attached.","fields":{},"reply":null},"E-18":{"type":"purchase_order","confidence":0.95,"summary":"PO with three lines.","fields":{"po_number":"PO-2026-1204","ship_to":null,"requested_date":null,"total":646.0,"lines":[{"sku":"GLV-NIT-M","qty":20,"unit_price":14.5},{"sku":"MSK-L2-50","qty":10,"unit_price":11.2},{"sku":"BIB-2PLY-500","qty":2,"unit_price":32.0}]},"reply":"Hi Luka, thank you for PO-2026-1204, EUR 646.00. Logged."},"E-19":{"type":"other","confidence":0.9,"summary":"Short acknowledgement, nothing to do.","fields":{},"reply":null},"E-20":{"type":"purchase_order","confidence":0.97,"summary":"PO with masks and saliva ejectors.","fields":{"po_number":"PO-2026-1205","ship_to":null,"requested_date":null,"total":131.2,"lines":[{"sku":"MSK-L2-50","qty":6,"unit_price":11.2},{"sku":"SAL-EJ-100","qty":10,"unit_price":6.4}]},"reply":"Hi Amira, thank you for PO-2026-1205 (2 lines, EUR 131.20). It's logged and we'll confirm dispatch."},"E-21":{"type":"payment_change","confidence":0.92,"summary":"Asks to change the bank account for supplier payments.","fields":{},"reply":null},"E-22":{"type":"support","confidence":0.9,"summary":"Carrier delivery exception for PO-2026-1190.","fields":{"po_number":"PO-2026-1190","issue":"delivery_exception","urgency":"normal"},"reply":"Thanks for the update."},"E-23":{"type":"quote_request","confidence":0.93,"summary":"Quote for composite, asks for 20% discount.","fields":{"lines":[{"sku":"CMP-A2-4G","qty":30}],"customer_ask":"20% discount"},"reply":"Hi Mark, given the trouble with your last order we can offer 20% off: 30 x Composite A2 at EUR 27.90, EUR 669.60 after discount."},"E-24":{"error":"HTTP 529 overloaded_error from api.anthropic.com on every attempt"}},"retry":{"E-24":{"type":"purchase_order","confidence":0.97,"summary":"One more order with large gloves and alginate.","fields":{"po_number":"PO-2026-1206","ship_to":null,"requested_date":null,"total":211.5,"lines":[{"sku":"GLV-NIT-L","qty":12,"unit_price":14.5},{"sku":"IMP-ALG-500","qty":2,"unit_price":18.75}]},"reply":"Hi Amira, thank you for PO-2026-1206 (2 lines, EUR 211.50). It's logged and we'll confirm dispatch."}},"failures":{"Orders sheet: upsert|<r20@lakeside-clinic.example>":1},"workflow":{"name":"Shared inbox agent (orders@)","nodes":[{"name":"Gmail Trigger","type":"gmailTrigger","position":[0,300],"retry":null,"creds":["gmailOAuth2"]},{"name":"Read Orders sheet","type":"googleSheets","position":[220,300],"retry":null,"creds":["googleSheetsOAuth2Api"]},{"name":"Normalize","type":"code","position":[440,300],"retry":null,"creds":[]},{"name":"Pre-screen","type":"code","position":[660,300],"retry":null,"creds":[]},{"name":"Needs the model?","type":"if","position":[880,300],"retry":null,"creds":[]},{"name":"Archive or skip","type":"gmail","position":[1100,560],"retry":null,"creds":["gmailOAuth2"]},{"name":"Claude: read email","type":"httpRequest","position":[1100,300],"retry":3,"creds":["httpHeaderAuth"]},{"name":"Decide","type":"code","position":[1320,300],"retry":null,"creds":[]},{"name":"Route","type":"switch","position":[1540,300],"retry":null,"creds":[]},{"name":"Orders sheet: upsert","type":"googleSheets","position":[1780,0],"retry":3,"creds":["googleSheetsOAuth2Api"]},{"name":"HubSpot: create deal","type":"hubspot","position":[1780,190],"retry":3,"creds":["hubspotOAuth2Api"]},{"name":"Helpdesk: create ticket","type":"httpRequest","position":[1780,380],"retry":3,"creds":[]},{"name":"AP inbox: append","type":"googleSheets","position":[1780,580],"retry":null,"creds":["googleSheetsOAuth2Api"]},{"name":"Review queue: append","type":"googleSheets","position":[1780,770],"retry":null,"creds":["googleSheetsOAuth2Api"]},{"name":"Error queue: append","type":"googleSheets","position":[1780,960],"retry":null,"creds":["googleSheetsOAuth2Api"]},{"name":"Has a draft?","type":"if","position":[2020,190],"retry":null,"creds":[]},{"name":"Gmail: save draft","type":"gmail","position":[2240,190],"retry":null,"creds":["gmailOAuth2"]}],"connections":{"Gmail Trigger":{"main":[[{"node":"Read Orders sheet","type":"main","index":0}]]},"Read Orders sheet":{"main":[[{"node":"Normalize","type":"main","index":0}]]},"Normalize":{"main":[[{"node":"Pre-screen","type":"main","index":0}]]},"Pre-screen":{"main":[[{"node":"Needs the model?","type":"main","index":0}]]},"Needs the model?":{"main":[[{"node":"Claude: read email","type":"main","index":0}],[{"node":"Archive or skip","type":"main","index":0}]]},"Claude: read email":{"main":[[{"node":"Decide","type":"main","index":0}],[{"node":"Decide","type":"main","index":0}]]},"Decide":{"main":[[{"node":"Route","type":"main","index":0}]]},"Route":{"main":[[{"node":"Orders sheet: upsert","type":"main","index":0}],[{"node":"HubSpot: create deal","type":"main","index":0}],[{"node":"Helpdesk: create ticket","type":"main","index":0}],[{"node":"Has a draft?","type":"main","index":0}],[{"node":"AP inbox: append","type":"main","index":0}],[{"node":"Review queue: append","type":"main","index":0}],[{"node":"Error queue: append","type":"main","index":0}]]},"Orders sheet: upsert":{"main":[[{"node":"Has a draft?","type":"main","index":0}],[{"node":"Error queue: append","type":"main","index":0}]]},"HubSpot: create deal":{"main":[[{"node":"Has a draft?","type":"main","index":0}],[{"node":"Error queue: append","type":"main","index":0}]]},"Helpdesk: create ticket":{"main":[[{"node":"Has a draft?","type":"main","index":0}],[{"node":"Error queue: append","type":"main","index":0}]]},"Has a draft?":{"main":[[{"node":"Gmail: save draft","type":"main","index":0}],[]]}}},"evals":{"cases":[{"id":"E-01","subject":"PO-2026-1201 weekly restock","want":"orders","got":"orders","draft":true,"pass":true,"why":""},{"id":"E-02","subject":"Order PO-2026-1202","want":"review","got":"review","draft":false,"pass":true,"why":"price differs from the price list"},{"id":"E-03","subject":"Urgent PO-2026-1203, ship today","want":"review","got":"review","draft":false,"pass":true,"why":"lookalike sender domain"},{"id":"E-04","subject":"Fwd: PO-2026-1201 weekly restock","want":"orders","got":"orders","draft":false,"pass":true,"why":"same PO resent"},{"id":"E-05","subject":"Order PO-2026-1202","want":"skipped","got":"skipped","draft":false,"pass":true,"why":"trigger delivered it twice"},{"id":"E-06","subject":"Quote for gloves and pouches","want":"quotes","got":"quotes","draft":true,"pass":true,"why":""},{"id":"E-07","subject":"New practice, price list?","want":"quotes","got":"quotes","draft":true,"pass":true,"why":""},{"id":"E-08","subject":"Damaged boxes in PO-2026-1188","want":"support","got":"support","draft":true,"pass":true,"why":""},{"id":"E-09","subject":"WRONG ITEMS AGAIN","want":"support","got":"support","draft":true,"pass":true,"why":""},{"id":"E-10","subject":"Alginate setting time question","want":"support","got":"support","draft":true,"pass":true,"why":""},{"id":"E-11","subject":"Where is PO-2026-1175?","want":"status","got":"status","draft":true,"pass":true,"why":"model draft promised a delivery date"},{"id":"E-12","subject":"Status PO-2026-1099","want":"review","got":"review","draft":false,"pass":true,"why":"PO not found"},{"id":"E-13","subject":"Automatic reply: Where is PO-2026-1175?","want":"skipped","got":"skipped","draft":false,"pass":true,"why":"out-of-office reply"},{"id":"E-14","subject":"December promotions for distributors","want":"skipped","got":"skipped","draft":false,"pass":true,"why":"newsletter"},{"id":"E-15","subject":"Invoice INV-88412","want":"accounts","got":"accounts","draft":false,"pass":true,"why":""},{"id":"E-16","subject":"Order + card","want":"review","got":"review","draft":false,"pass":true,"why":"card number in the body, no PO number"},{"id":"E-17","subject":"see attached","want":"review","got":"review","draft":false,"pass":true,"why":"model unsure"},{"id":"E-18","subject":"PO-2026-1204","want":"review","got":"review","draft":false,"pass":true,"why":"PO total doesn't match its lines"},{"id":"E-19","subject":"re: re: re: gloves","want":"done","got":"done","draft":false,"pass":true,"why":""},{"id":"E-20","subject":"PO-2026-1205","want":"orders","got":"orders","draft":true,"pass":true,"why":"Sheets returned 429 once"},{"id":"E-21","subject":"Updated bank details for payments","want":"review","got":"review","draft":false,"pass":true,"why":"bank-detail change from a lookalike domain"},{"id":"E-22","subject":"Delivery exception PL7731941102","want":"support","got":"support","draft":false,"pass":true,"why":"automated sender, no reply"},{"id":"E-23","subject":"Quote: 30 composite syringes, 20% off?","want":"quotes","got":"quotes","draft":true,"pass":true,"why":"model draft offered a discount"},{"id":"E-24","subject":"PO-2026-1206","want":"error","got":"error","draft":false,"pass":true,"why":"model API down on every retry"}],"passed":24,"total":24,"sent":0,"drafts":9,"double_confirmations":0,"order_rows_unique":true,"spoofs_caught":2,"secrets_reaching_model":0,"drafts_rejected":[{"id":"E-11","reason":"promises a delivery date"},{"id":"E-23","reason":"offers a discount"}],"retried_ok":[["Orders sheet: upsert","<r20@lakeside-clinic.example>","appended row (after 2 attempts)"]],"parked":1}};</script>
+<script>// Decision logic for the shared-inbox workflow. The same file is pasted into the
+// n8n Code nodes (workflow/build.py), run by the replay harness, and used by the
+// live demo, so what you test is what runs in n8n.
+//
+// The model classifies and extracts; this code decides. Nothing here sends mail:
+// replies are only ever saved as drafts for a person to approve.
+
+const CARD = /\b(?:\d[ -]?){13,19}\b/g;
+const IBAN = /\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b/g;
+const PO_RE = /^PO-\d{4}-\d{4}$/;
+
+function domainOf(from) {
+  const m = String(from).match(/<([^>]+)>/);
+  const addr = (m ? m[1] : String(from)).trim().toLowerCase();
+  return { address: addr, local: addr.split("@")[0], domain: addr.split("@")[1] || "" };
+}
+
+function luhn(digits) {
+  let sum = 0, alt = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let n = +digits[i];
+    if (alt) { n *= 2; if (n > 9) n -= 9; }
+    sum += n; alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+
+// Card numbers (Luhn-valid) and IBANs never reach the model or a sheet.
+function redact(text) {
+  const found = [];
+  let out = String(text || "").replace(CARD, (m) => {
+    const d = m.replace(/\D/g, "");
+    if (d.length >= 13 && luhn(d)) { found.push("card number"); return "[card number removed]"; }
+    return m;
+  });
+  out = out.replace(IBAN, () => { found.push("bank account"); return "[bank account removed]"; });
+  return { text: out, found: Array.from(new Set(found)) };
+}
+
+function normalize(email) {
+  const sender = domainOf(email.from);
+  const body = redact(email.text);
+  const att = (email.attachments || []).map((a) => ({ name: a.name, text: redact(a.text).text }));
+  return {
+    id: email.id, message_id: email.message_id, subject: email.subject, received: email.received,
+    from: email.from, sender: sender.address, local: sender.local, domain: sender.domain,
+    headers: email.headers || {}, text: body.text, redacted: body.found, attachments: att,
+  };
+}
+
+// Lookalike domains: same as a known one after undoing common swaps, but not identical.
+function skeleton(d) {
+  return d.toLowerCase().replace(/rn/g, "m").replace(/vv/g, "w").replace(/[1|]/g, "l").replace(/0/g, "o").replace(/5/g, "s");
+}
+function editDistance(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i].concat(new Array(b.length).fill(0)));
+  for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++)
+    for (let j = 1; j <= b.length; j++)
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return dp[a.length][b.length];
+}
+function lookalike(domain, known) {
+  if (known.indexOf(domain) >= 0) return null;
+  for (const k of known) {
+    if (skeleton(k) === skeleton(domain) || editDistance(k, domain) <= 2) return k;
+  }
+  return null;
+}
+
+// Before any model call: loops, bulk mail, duplicates, lookalikes.
+function prescreen(msg, seen, world) {
+  const h = Object.keys(msg.headers).reduce((o, k) => { o[k.toLowerCase()] = String(msg.headers[k]).toLowerCase(); return o; }, {});
+  if (seen.indexOf(msg.message_id) >= 0) return { action: "ignore", reason: "same Message-ID already processed (trigger delivered it twice)" };
+  if ((h["auto-submitted"] && h["auto-submitted"] !== "no") || /^(automatic reply|auto:|out of office)/i.test(msg.subject))
+    return { action: "ignore", reason: "automatic reply; answering it could start a mail loop" };
+  if (h["list-unsubscribe"] || h["precedence"] === "bulk")
+    return { action: world.settings.archive_newsletters ? "archive" : "ignore", reason: "newsletter or bulk mail" };
+  const known = Object.keys(world.customers).concat(world.suppliers);
+  const like = lookalike(msg.domain, known);
+  if (like) return { action: "continue", flag: "lookalike", reason: "sender domain " + msg.domain + " imitates " + like };
+  return { action: "continue" };
+}
+
+function money(n) { return Math.round(n * 100) / 100; }
+function fmt(n) { return money(n).toFixed(2); }
+
+function validateLines(lines, world, needPrice) {
+  const issues = [];
+  (lines || []).forEach((l) => {
+    const p = world.products[l.sku];
+    if (!p) { issues.push("unknown product " + l.sku); return; }
+    if (!(Number.isInteger(l.qty) && l.qty > 0)) issues.push("bad quantity for " + l.sku);
+    if (needPrice && l.unit_price != null && money(l.unit_price) !== money(p.price))
+      issues.push(l.sku + " at EUR " + fmt(l.unit_price) + " but the price list says EUR " + fmt(p.price));
+  });
+  if (!lines || !lines.length) issues.push("no order lines found");
+  return issues;
+}
+
+function priced(lines, world) {
+  return lines.map((l) => {
+    const p = world.products[l.sku];
+    return { sku: l.sku, name: p ? p.name : l.sku, qty: l.qty, unit_price: p ? p.price : null, line_total: p ? money(p.price * l.qty) : null };
+  });
+}
+
+// Every number and date in a reply must come from the facts code allowed;
+// discounts, guarantees and delivery promises are never left to the model.
+function checkReply(text, facts) {
+  if (!text) return "no draft";
+  const banned = [[/\b\d+ ?% ?(off|discount)\b|\bdiscount\b/i, "offers a discount"], [/\bguarantee/i, "makes a guarantee"],
+    [/\bship (it )?today\b|\bwill arrive\b|\barrive (on|by)?\s*(mon|tue|wed|thu|fri|sat|sun)/i, "promises a delivery date"]];
+  for (const [re, why] of banned) if (re.test(text)) return why;
+  const allowed = new Set();
+  facts.forEach((f) => String(f).replace(/,/g, "").match(/\d+(?:\.\d+)?/g)?.forEach((n) => allowed.add(String(+n))));
+  const nums = (text.replace(/,/g, "").match(/\d+(?:\.\d+)?/g) || []).map((n) => String(+n));
+  const stray = nums.filter((n) => !allowed.has(n));
+  if (stray.length) return "states " + Array.from(new Set(stray)).join(", ") + ", which is not in the order data";
+  return null;
+}
+
+function approver(amount, world) { return amount != null && amount > world.settings.lead_approval_over ? "lead" : "agent"; }
+
+// The model's reading of the email -> what the workflow does.
+function decide(msg, screen, model, ctx, world) {
+  const s = world.settings;
+  const out = { id: msg.id, route: "review", issues: [], flags: [], actions: [], draft: null };
+  if (msg.redacted.length) out.flags.push("removed " + msg.redacted.join(" and ") + " before the model saw it");
+  if (screen.flag === "lookalike") { out.flags.push(screen.reason); out.issues.push("possible spoofed sender"); }
+  if (!model || model.error) { out.route = "error"; out.issues.push(model ? model.error : "no model result"); return out; }
+  out.type = model.type; out.confidence = model.confidence; out.summary = model.summary;
+  if (model.confidence < s.confidence_threshold) { out.issues.push("model unsure (" + model.confidence + ")"); }
+  const f = model.fields || {}, customer = world.customers[msg.domain];
+  const isSystem = /^(no-?reply|mailer-daemon|notifications?)$/.test(msg.local);
+  let facts = [], amount = null;
+
+  if (model.type === "purchase_order") {
+    if (!f.po_number || !PO_RE.test(f.po_number)) out.issues.push("no valid PO number");
+    if (!customer) out.issues.push("sender is not a known customer");
+    out.issues = out.issues.concat(validateLines(f.lines, world, true));
+    const sum = money((f.lines || []).reduce((t, l) => t + (l.unit_price || 0) * l.qty, 0));
+    if (f.total != null && money(f.total) !== sum) out.issues.push("PO total EUR " + fmt(f.total) + " does not match the lines (EUR " + fmt(sum) + ")");
+    const dup = f.po_number && ctx.orders.some((o) => o.po === f.po_number);
+    amount = f.total;
+    out.record = { sheet: "Orders", key: f.po_number, row: { po: f.po_number, customer: customer ? customer.name : msg.domain, total: f.total, lines: (f.lines || []).length, requested: f.requested_date || "", status: "New", source: msg.message_id } };
+    if (!out.issues.length) {
+      out.route = "orders";
+      if (dup) { out.flags.push("PO already in the Orders sheet; row updated, no second confirmation"); out.duplicate = true; }
+      facts = [f.po_number, (f.lines || []).length, fmt(f.total), f.requested_date || "", f.ship_to || ""];
+    }
+  } else if (model.type === "quote_request") {
+    out.issues = out.issues.concat(validateLines(f.lines, world, false));
+    if (!out.issues.length) {
+      const lines = priced(f.lines, world);
+      amount = money(lines.reduce((t, l) => t + l.line_total, 0));
+      out.route = "quotes";
+      out.record = { system: "HubSpot", object: "deal", key: msg.message_id, row: { name: (customer ? customer.name : msg.sender) + " quote", amount: amount, stage: "Quote requested", company: customer ? customer.hubspot_id : "new contact: " + msg.sender, lines: lines } };
+      if (f.customer_ask) out.flags.push("customer asks for " + f.customer_ask + "; a person decides");
+      facts = lines.map((l) => l.qty).concat(lines.map((l) => fmt(l.unit_price)), lines.map((l) => l.name), [fmt(amount)]);
+    }
+  } else if (model.type === "support") {
+    const prio = f.issue === "damaged" || f.issue === "wrong_item" ? "high" : "normal";
+    out.route = "support";
+    out.record = { system: "Helpdesk", object: "ticket", key: msg.message_id, row: { subject: msg.subject, requester: msg.sender, po: f.po_number || "", issue: f.issue, priority: prio } };
+    facts = [f.po_number || ""];
+  } else if (model.type === "order_status") {
+    const o = ctx.orders.find((r) => r.po === f.po_number);
+    out.route = "status";
+    out.lookup = o || null;
+    if (!o) { out.route = "review"; out.issues.push(f.po_number + " is not in the Orders sheet"); }
+    else facts = [o.po, o.status, o.shipped || "", o.carrier || "", o.tracking || ""];
+  } else if (model.type === "invoice") {
+    out.route = "accounts";
+    out.record = { sheet: "AP inbox", key: f.invoice_number, row: { invoice: f.invoice_number, supplier: msg.domain, amount: f.amount, due: f.due } };
+  } else if (model.type === "payment_change") {
+    out.route = "review"; out.issues.push("asks to change payment details; verify by phone with a known contact");
+  } else {
+    out.route = out.issues.length ? "review" : "done";
+    if (!out.issues.length) out.flags.push("nothing to do");
+  }
+  if (out.issues.length) out.route = "review";
+
+  // Reply draft: only for routes that answer the customer, never to system senders.
+  const answers = { orders: 1, quotes: 1, support: 1, status: 1 };
+  if (answers[out.route] && !isSystem && !(out.duplicate)) {
+    const reason = checkReply(model.reply, facts);
+    const text = reason ? template(out, msg, f, world) : model.reply;
+    out.draft = { to: msg.sender, subject: "Re: " + msg.subject, text: text, by: reason ? "template" : "model", rejected: reason, approver: approver(amount, world), state: "awaiting approval" };
+  } else if (answers[out.route] && isSystem) {
+    out.flags.push("no reply: automated sender");
+  }
+  return out;
+}
+
+function greeting(msg) {
+  const name = String(msg.from).split("<")[0].trim().replace(/^Dr\.\s*/, "").split(" ")[0];
+  return name && !/^(reception|accounts|polar)$/i.test(name) ? "Hi " + name + "," : "Hello,";
+}
+
+// Plain, safe replies built only from checked data.
+function template(out, msg, f, world) {
+  const g = greeting(msg);
+  if (out.route === "orders") return g + " thank you for " + f.po_number + ". We've logged it and will confirm dispatch by email.";
+  if (out.route === "quotes") {
+    const r = out.record.row;
+    const lines = r.lines.map((l) => l.qty + " x " + l.name + " at EUR " + fmt(l.unit_price)).join("; ");
+    return g + " here is your quote: " + lines + ". Total EUR " + fmt(r.amount) + " excluding VAT. Reply to confirm and we'll book it in.";
+  }
+  if (out.route === "status") {
+    const o = out.lookup;
+    return o.tracking ? g + " " + o.po + " shipped on " + o.shipped + " with " + o.carrier + ", tracking " + o.tracking + "." : g + " " + o.po + (o.status === "New" ? " has been received and is being prepared." : " is at the " + o.status.toLowerCase() + " stage now.") + " We'll send tracking as soon as it ships.";
+  }
+  if (out.route === "support") return g + " thanks for letting us know. We've opened a ticket" + (f.po_number ? " for " + f.po_number : "") + " and will get back to you shortly.";
+  return g + " thanks for your email.";
+}
+
+const api = { normalize, redact, prescreen, lookalike, decide, checkReply, priced, template, domainOf };
+if (typeof module !== "undefined" && module.exports) module.exports = api;
+if (typeof window !== "undefined") window.InboxCore = api;
+</script>
+<script>// The whole workflow run as one function, for the live demo. It calls the same
+// core.js functions the n8n Code nodes call, in the same order; tests/test_parity.py
+// checks it against a replay of workflow/inbox-agent.json.
+(function (root) {
+  "use strict";
+  var C = typeof module !== "undefined" && module.exports ? require("./core.js") : root.InboxCore;
+
+  var ROUTE_NODE = { orders: "Orders sheet: upsert", quotes: "HubSpot: create deal", support: "Helpdesk: create ticket",
+    accounts: "AP inbox: append", review: "Review queue: append", error: "Error queue: append" };
+
+  function runInbox(emails, recorded, world, opts) {
+    opts = opts || {};
+    var failures = opts.failures || {};
+    var seen = [], pos = [], out = [];
+    var sheet = JSON.parse(JSON.stringify(world.orders_sheet));
+    emails.forEach(function (e) {
+      var msg = C.normalize(e);
+      var screen = C.prescreen(msg, seen, world);
+      seen.push(msg.message_id);
+      var path = ["Gmail Trigger", "Read Orders sheet", "Normalize", "Pre-screen", "Needs the model?"];
+      if (screen.action !== "continue") {
+        path.push("Archive or skip");
+        out.push({ id: e.id, msg: msg, screen: screen, route: screen.action === "archive" ? "archived" : "skipped", path: path, issues: [], flags: [screen.reason], draft: null });
+        return;
+      }
+      var rec = recorded[e.id];
+      var attempts = { "Claude: read email": rec && !rec.error ? 1 : 3 };
+      var model = rec ? rec : { error: "model reply was not valid JSON" };
+      path.push("Claude: read email", "Decide", "Route");
+      var known = sheet.concat(pos.filter(function (p) { return !sheet.some(function (r) { return r.po === p.po; }); }));
+      var d = C.decide(msg, screen, model, { orders: known }, world);
+      if (d.route === "orders" && !d.duplicate) pos.push({ po: d.record.key, status: "New" });
+      var node = ROUTE_NODE[d.route];
+      if (node) path.push(node);
+      var fail = failures[node + "|" + msg.message_id] || 0;
+      if (fail) attempts[node] = Math.min(fail + 1, 3);
+      if (fail >= 3) { d.issues.push(node + ": HTTP 429"); d.route = "error"; d.draft = null; path.push("Error queue: append"); }
+      if (d.draft && ["orders", "quotes", "support", "status"].indexOf(d.route) >= 0) path.push("Has a draft?", "Gmail: save draft");
+      else if (["orders", "quotes", "support", "status"].indexOf(d.route) >= 0) path.push("Has a draft?");
+      out.push(Object.assign({ msg: msg, screen: screen, path: path, attempts: attempts }, d));
+    });
+    return out;
+  }
+
+  var api = { runInbox: runInbox, ROUTE_NODE: ROUTE_NODE };
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else root.InboxPipeline = api;
+})(this);
+</script>
+<script>(function () {
+  "use strict";
+  var D = window.MAILROOM, C = window.InboxCore, P = window.InboxPipeline;
+  var W0 = D.world;
+  var USERS = W0.users;
+  var ROUTES = {
+    orders: ["Orders", "#0f5257"], quotes: ["Quotes", "#4a3a8c"], support: ["Support", "#e8701a"], status: ["Order status", "#2c5e8a"],
+    accounts: ["Accounts", "#8a7428"], review: ["Needs a person", "#6b2d5c"], error: ["Errors", "#b23a2b"],
+    done: ["No action", "#9a968c"], archived: ["Archived", "#9a968c"], skipped: ["Skipped", "#9a968c"],
+  };
+  var S = {
+    as: "mia", settings: JSON.parse(JSON.stringify(W0.settings)), overrides: {}, drafts: {}, resolved: {}, log: [],
+    route: "inbox", folder: "all", mail: null, node: null, sheet: "Orders",
+  };
+  var R = [];
+
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function $(s) { return document.querySelector(s); }
+  function hhmm(iso) { return iso ? iso.slice(11, 16) : ""; }
+  function fromName(f) { return String(f).split("<")[0].trim() || f; }
+  function slug(n) { return n.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""); }
+  function byId(id) { return R.filter(function (r) { return r.id === id; })[0]; }
+  function email(id) { return D.emails.filter(function (e) { return e.id === id; })[0]; }
+  function isLead() { return USERS[S.as].role === "lead"; }
+  function toast(t) { var el = $("#toast"); el.textContent = t; el.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(function () { el.classList.remove("show"); }, 2300); }
+  function tag(route) { var r = ROUTES[route] || [route]; return '<span class="tag t-' + route + '">' + esc(r[0]) + "</span>"; }
+  function log(what) { S.log.unshift({ who: USERS[S.as].name, what: what, at: new Date().toTimeString().slice(0, 5) }); }
+
+  function compute() {
+    var world = Object.assign({}, W0, { settings: S.settings });
+    var rec = Object.assign({}, D.recorded, S.overrides);
+    R = P.runInbox(D.emails, rec, world, { failures: D.failures });
+    R.forEach(function (r) {
+      if (r.draft && !S.drafts[r.id]) S.drafts[r.id] = { state: "awaiting approval", text: r.draft.text };
+      if (r.draft && S.drafts[r.id] && S.drafts[r.id].base !== r.draft.text) { S.drafts[r.id].text = S.drafts[r.id].edited ? S.drafts[r.id].text : r.draft.text; S.drafts[r.id].base = r.draft.text; }
+    });
+  }
+
+  function folderOf(r) { return r.route; }
+  function inFolder(r, f) {
+    if (f === "all") return true;
+    if (f === "drafts") return r.draft && S.drafts[r.id] && S.drafts[r.id].state === "awaiting approval";
+    if (f === "skipped") return r.route === "skipped" || r.route === "archived" || r.route === "done";
+    return r.route === f;
+  }
+
+  // ---------- routing ----------
+  function parse() {
+    var h = location.hash.replace(/^#/, ""), q = "";
+    if (h.indexOf("?") >= 0) { q = h.split("?")[1]; h = h.split("?")[0]; }
+    var as = (q.match(/as=(\w+)/) || [])[1];
+    if (as && USERS[as]) S.as = as;
+    var p = (h || "inbox").split("/");
+    S.route = p[0];
+    if (p[0] === "inbox") { S.folder = p[1] || S.folder || "all"; S.mail = S.mail && inFolder(byId(S.mail), S.folder) ? S.mail : null; }
+    if (p[0] === "mail") { S.route = "inbox"; S.mail = p[1]; if (!inFolder(byId(p[1]), S.folder)) S.folder = "all"; }
+    if (p[0] === "node") { S.route = "workflow"; S.node = p.slice(1).join("/"); }
+    if (p[0] === "workflow") S.node = S.node || null;
+    if (p[0] === "sheets" && p[1]) S.sheet = decodeURIComponent(p[1]);
+  }
+
+  // ---------- top bar ----------
+  function topbar() {
+    var awaiting = R.filter(function (r) { return r.draft && S.drafts[r.id].state === "awaiting approval"; }).length;
+    var review = R.filter(function (r) { return r.route === "review" && !S.resolved[r.id]; }).length;
+    var errs = R.filter(function (r) { return r.route === "error"; }).length;
+    var tabs = [["inbox", "Inbox"], ["approvals", "Approvals", awaiting], ["review", "Review", review], ["workflow", "Workflow"], ["sheets", "Sheets"], ["errors", "Errors", errs], ["evals", "Evals"], ["settings", "Settings"]];
+    return '<header class="top"><div class="brand"><span class="stamp">@</span><div>Mailroom<small>' + esc(W0.inbox) + " · n8n + Claude</small></div></div><nav class=\"tabs\">" +
+      tabs.map(function (t) { return '<a href="#' + t[0] + '" class="' + (S.route === t[0] ? "on" : "") + '">' + t[1] + (t[2] ? '<span class="n">' + t[2] + "</span>" : "") + "</a>"; }).join("") +
+      '</nav><div class="who"><label for="as" class="sr">Signed in as</label><select id="as">' + Object.keys(USERS).map(function (u) {
+        return '<option value="' + u + '"' + (u === S.as ? " selected" : "") + ">" + esc(USERS[u].name) + " · " + esc(USERS[u].title) + "</option>";
+      }).join("") + "</select></div></header>";
+  }
+
+  // ---------- inbox ----------
+  function inbox() {
+    var folders = [["all", "All mail"], ["drafts", "Drafts to approve"], ["orders", "Orders"], ["quotes", "Quotes"], ["support", "Support"], ["status", "Order status"], ["accounts", "Accounts"], ["review", "Needs a person"], ["error", "Errors"], ["skipped", "Skipped & archived"]];
+    var h = '<aside class="folders"><h4>' + esc(W0.inbox) + "</h4>" + folders.map(function (f) {
+      var n = R.filter(function (r) { return inFolder(r, f[0]); }).length;
+      var col = (ROUTES[f[0]] || [0, "#9a968c"])[1];
+      return '<a href="#inbox/' + f[0] + '" class="' + (S.folder === f[0] ? "on" : "") + '"><span class="dot" style="background:' + (f[0] === "all" ? "#1b1f24" : f[0] === "drafts" ? "#2f7d4f" : col) + '"></span>' + f[1] + '<span class="c">' + n + "</span></a>";
+    }).join("") + '<h4>Keys</h4><div class="small" style="padding:0 8px"><span class="kbd">j</span> <span class="kbd">k</span> next / previous<br><span class="kbd">a</span> approve draft<br><span class="kbd">g w</span> workflow</div></aside>';
+    var list = R.filter(function (r) { return inFolder(r, S.folder); });
+    h += '<div class="list" role="list">' + (list.length ? list.map(function (r) {
+      var e = email(r.id), d = S.drafts[r.id];
+      return '<a role="listitem" class="row' + (S.mail === r.id ? " on" : "") + '" href="#mail/' + r.id + '"><div class="r1"><span class="from">' + esc(fromName(e.from)) + '</span><span class="time">' + hhmm(e.received) + '</span></div><div class="subj">' + esc(e.subject) + '</div><div class="meta">' + tag(r.route) +
+        (d && r.draft ? '<span class="tag t-draft">' + (d.state === "awaiting approval" ? "draft · " + r.draft.approver : d.state) + "</span>" : "") +
+        (r.flags.some(function (f) { return /imitates|removed/.test(f); }) ? '<span class="tag t-flag">security</span>' : "") + "</div></a>";
+    }).join("") : '<div class="empty"><h2>Nothing here</h2><p>This folder is empty right now.</p></div>') + "</div>";
+    h += '<section class="read">' + (S.mail ? mailView(byId(S.mail)) : '<div class="empty"><h2>Pick an email</h2><p>Every email that reached orders@ this morning, with what the n8n workflow did to it. Start with <a href="#mail/E-01">the first purchase order</a> or the <a href="#inbox/drafts">drafts waiting for approval</a>.</p></div>') + "</section>";
+    return '<div class="body">' + h + "</div>";
+  }
+
+  function pathHtml(r) {
+    return '<div class="path">' + r.path.map(function (n, i) {
+      var tries = r.attempts && r.attempts[n] > 1 ? '<span class="retry"> ×' + r.attempts[n] + "</span>" : "";
+      return (i ? '<span class="arr">→</span>' : "") + '<a href="#node/' + slug(n) + '">' + esc(n) + tries + "</a>";
+    }).join("") + "</div>";
+  }
+
+  function fieldsHtml(r) {
+    var rec = (Object.assign({}, D.recorded, S.overrides))[r.id];
+    if (!rec || rec.error) return "";
+    var f = rec.fields || {}, h = '<dl class="facts"><dt>Read as</dt><dd>' + esc(rec.type.replace("_", " ")) + " · confidence " + rec.confidence + "</dd><dt>Summary</dt><dd>" + esc(rec.summary) + "</dd>";
+    ["po_number", "ship_to", "requested_date", "total", "issue", "urgency", "invoice_number", "amount", "due", "customer_ask"].forEach(function (k) {
+      if (f[k] != null) h += "<dt>" + k.replace(/_/g, " ") + "</dt><dd>" + esc(f[k]) + "</dd>";
+    });
+    h += "</dl>";
+    if (f.lines && f.lines.length) {
+      h += '<table class="lines"><tr><th>SKU</th><th>Product</th><th>Qty</th><th>Price in email</th><th>Price list</th><th></th></tr>' + f.lines.map(function (l) {
+        var p = W0.products[l.sku];
+        var ok = p && (l.unit_price == null || Math.abs(l.unit_price - p.price) < 0.005);
+        return "<tr><td>" + esc(l.sku) + "</td><td>" + esc(p ? p.name : "unknown product") + "</td><td>" + l.qty + "</td><td>" + (l.unit_price != null ? l.unit_price.toFixed(2) : "—") + "</td><td>" + (p ? p.price.toFixed(2) : "—") + '</td><td class="' + (ok ? "ok" : "bad") + '">' + (ok ? "✓" : "✗") + "</td></tr>";
+      }).join("") + "</table>";
+    }
+    return h;
+  }
+
+  function draftHtml(r) {
+    var d = S.drafts[r.id], dr = r.draft;
+    var can = dr.approver === "agent" || isLead();
+    var h = '<div class="draft"><div class="dh"><b>Draft reply</b><span>to ' + esc(dr.to) + "</span><span>· written by " + (dr.by === "model" ? "Claude, checked by code" : "a safe template") + "</span><span style=\"margin-left:auto\">" + (dr.approver === "lead" ? "needs the operations lead" : "any agent can approve") + "</span></div>";
+    if (dr.rejected) h += '<div class="why">Claude\'s draft was replaced: it ' + esc(dr.rejected) + ".</div>";
+    if (d.state === "awaiting approval") {
+      h += '<textarea id="draft-text" aria-label="Draft reply">' + esc(d.text) + '</textarea><div class="act"><button class="btn go" data-approve="' + r.id + '" ' + (can ? "" : "disabled") + '>Approve and send</button><button class="btn" data-discard="' + r.id + '">Discard</button>' +
+        (can ? "" : '<span class="small">Over EUR ' + S.settings.lead_approval_over + ": switch to Tom Haller (operations lead) to approve.</span>") + '<span class="small" style="margin-left:auto">Saved as a Gmail draft; nothing is sent until someone approves.</span></div>';
+    } else {
+      h += '<div style="padding:12px 14px;white-space:pre-wrap">' + esc(d.text) + '</div><div class="act"><span class="tag ' + (d.state === "sent" ? "t-draft" : "t-skipped") + '">' + esc(d.state) + "</span><span class=\"small\">" + esc(d.note || "") + "</span></div>";
+    }
+    return h + "</div>";
+  }
+
+  function mailView(r) {
+    if (!r) return '<div class="empty"><h2>Not found</h2></div>';
+    var e = email(r.id);
+    var h = "<h1>" + esc(e.subject) + '</h1><div class="hdr">' + esc(e.from) + " · " + e.received.replace("T", " ").slice(0, 16) + " · " + tag(r.route) + (e.note ? " · " + esc(e.note) : "") + "</div>";
+    h += '<div class="mail">' + esc(r.msg.text) + "</div>";
+    (r.msg.attachments || []).forEach(function (a) { if (a.text) h += '<div class="att"><b>📎 ' + esc(a.name) + "</b>\n" + esc(a.text) + "</div>"; });
+    h += '<div class="sec"><h3>Path through the workflow</h3>' + pathHtml(r) + "</div>";
+    if (r.issues.length || r.flags.length) h += '<div class="sec"><h3>Why</h3>' + r.issues.map(function (i) { return '<div class="issue">' + esc(i) + "</div>"; }).join("") + r.flags.map(function (f) { return '<div class="flag">' + esc(f) + "</div>"; }).join("") + "</div>";
+    var fh = fieldsHtml(r);
+    if (fh) h += '<div class="sec"><h3>What Claude read, and what code checked</h3>' + fh + "</div>";
+    if (r.record) {
+      var where = r.record.sheet ? "Google Sheets · " + r.record.sheet : r.record.system + " · " + r.record.object;
+      h += '<div class="sec"><h3>Written to ' + esc(where) + '</h3><div class="att">' + esc(JSON.stringify(r.record.row, null, 1)) + "</div></div>";
+    }
+    if (r.lookup) h += '<div class="sec"><h3>Looked up in the Orders sheet</h3><div class="att">' + esc(JSON.stringify(r.lookup, null, 1)) + "</div></div>";
+    if (r.draft) h += '<div class="sec"><h3>Reply</h3>' + draftHtml(r) + "</div>";
+    if (r.route === "review") h += '<div class="sec"><h3>Your call</h3>' + reviewActions(r) + "</div>";
+    if (r.route === "error") h += '<div class="sec"><h3>Error queue</h3><div class="act"><button class="btn warn" data-retry="' + r.id + '">Retry now</button> <span class="small">The workflow already tried 3 times, 2 seconds apart.</span></div></div>';
+    return h;
+  }
+
+  function reviewActions(r) {
+    var done = S.resolved[r.id];
+    if (done) return '<div class="flag" style="background:var(--green-soft);color:var(--green)">Handled by ' + esc(done.who) + ": " + esc(done.how) + "</div>";
+    var spoof = r.flags.some(function (f) { return /imitates/.test(f); }) || /payment details/.test(r.issues.join(" "));
+    return '<div class="row" style="display:flex;gap:8px;flex-wrap:wrap">' +
+      (spoof ? '<button class="btn warn" data-resolve="' + r.id + '|Reported as phishing, sender blocked">Report as phishing</button>' : '<button class="btn go" data-resolve="' + r.id + '|Handled manually and replied">Handled, I replied myself</button>') +
+      '<button class="btn" data-resolve="' + r.id + '|Asked the sender to resend">Ask sender to resend</button><button class="btn" data-resolve="' + r.id + '|No action needed">No action needed</button></div>' +
+      (spoof ? '<p class="small">Lookalike senders and bank-detail changes can never be approved in the workflow. Verify by phone with a contact you already have.</p>' : "");
+  }
+
+  // ---------- approvals ----------
+  function approvals() {
+    var list = R.filter(function (r) { return r.draft; });
+    var h = '<div class="page"><h2>Reply drafts</h2><p class="lede">The workflow never sends email. It saves each reply as a Gmail draft, and a person approves it here. Quotes and orders over EUR ' + S.settings.lead_approval_over + " need the operations lead. Drafts Claude wrote are checked by code first: any price, date or number that isn't in the order data, any discount and any delivery promise sends the draft back to a safe template.</p>";
+    h += '<table class="t"><tr><th>Email</th><th>Route</th><th>Draft by</th><th>Approver</th><th>State</th><th></th></tr>' + list.map(function (r) {
+      var d = S.drafts[r.id], e = email(r.id), can = r.draft.approver === "agent" || isLead();
+      return '<tr><td><a href="#mail/' + r.id + '">' + esc(e.subject) + '</a><div class="small">' + esc(fromName(e.from)) + "</div></td><td>" + tag(r.route) + "</td><td>" + (r.draft.by === "model" ? "Claude" : "template" + (r.draft.rejected ? ' <span class="small">(' + esc(r.draft.rejected) + ")</span>" : "")) + "</td><td>" + (r.draft.approver === "lead" ? "Operations lead" : "Any agent") + "</td><td>" + esc(d.state) + "</td><td>" +
+        (d.state === "awaiting approval" ? '<button class="btn go" data-approve="' + r.id + '" ' + (can ? "" : 'disabled title="Needs the operations lead"') + ">Approve and send</button>" : "") + "</td></tr>";
+    }).join("") + "</table></div>";
+    return h;
+  }
+
+  // ---------- review ----------
+  function review() {
+    var list = R.filter(function (r) { return r.route === "review"; });
+    var h = '<div class="page"><h2>Needs a person</h2><p class="lede">Everything the workflow would not decide on its own: prices that don\'t match the price list, totals that don\'t add up, unknown POs, unsure readings, lookalike senders and requests to change bank details.</p><div class="cards">';
+    h += list.map(function (r) {
+      var e = email(r.id);
+      return '<div class="card"><h4><a href="#mail/' + r.id + '">' + esc(e.subject) + '</a></h4><div class="small">' + esc(e.from) + "</div>" + r.issues.map(function (i) { return '<div class="issue" style="margin-top:8px">' + esc(i) + "</div>"; }).join("") + r.flags.map(function (f) { return '<div class="flag">' + esc(f) + "</div>"; }).join("") + reviewActions(r) + "</div>";
+    }).join("") + "</div></div>";
+    return h;
+  }
+
+  // ---------- workflow canvas ----------
+  function workflow() {
+    var nodes = D.workflow.nodes, NW = 54, NH = 54;
+    var pos = {};
+    nodes.forEach(function (n) { pos[n.name] = { x: 30 + n.position[0] * 0.42, y: 40 + n.position[1] * 0.52 }; });
+    var count = {};
+    R.forEach(function (r) { r.path.forEach(function (n) { count[n] = (count[n] || 0) + 1; }); });
+    var sel = S.node ? nodes.filter(function (n) { return slug(n.name) === S.node; })[0] : null;
+    var hot = {};
+    if (sel) R.forEach(function (r) { var i = r.path.indexOf(sel.name); if (i >= 0) { if (i > 0) hot[r.path[i - 1] + ">" + sel.name] = 1; if (i < r.path.length - 1) hot[sel.name + ">" + r.path[i + 1]] = 1; } });
+    var edges = "";
+    Object.keys(D.workflow.connections).forEach(function (src) {
+      var outs = D.workflow.connections[src].main;
+      outs.forEach(function (out, oi) {
+        out.forEach(function (t) {
+          var a = pos[src], b = pos[t.node];
+          var off = outs.length > 1 ? (oi - (outs.length - 1) / 2) * Math.min(7, 40 / outs.length) : 0;
+          var x1 = a.x + NW, y1 = a.y + NH / 2 + off, x2 = b.x, y2 = b.y + NH / 2;
+          var mx = x1 + Math.max(24, (x2 - x1) / 2);
+          edges += '<path class="edge' + (hot[src + ">" + t.node] ? " hot" : "") + '" d="M' + x1 + "," + y1 + " C" + mx + "," + y1 + " " + (x2 - Math.max(24, (x2 - x1) / 2)) + "," + y2 + " " + x2 + "," + y2 + '"/>';
+        });
+      });
+    });
+    var GLYPH = { gmailTrigger: "⚡", googleSheets: "▦", code: "{ }", if: "?", switch: "⇶", gmail: "✉", hubspot: "◎", httpRequest: "⇄" };
+    var w = 0, hgt = 0;
+    var nd = nodes.map(function (n) {
+      var p = pos[n.name], c = count[n.name] || 0;
+      w = Math.max(w, p.x + NW + 70); hgt = Math.max(hgt, p.y + NH + 60);
+      var claude = /Claude/.test(n.name);
+      var col = claude ? "#e8701a" : /code/.test(n.type) ? "#0f5257" : /if|switch/.test(n.type) ? "#6b2d5c" : "#5c6670";
+      var words = n.name.split(" "), l1 = "", l2 = "";
+      words.forEach(function (wd) { if ((l1 + " " + wd).trim().length <= 15 && !l2) l1 = (l1 + " " + wd).trim(); else l2 = (l2 + " " + wd).trim(); });
+      return '<a href="#node/' + slug(n.name) + '" aria-label="' + esc(n.name) + '"><g class="nd' + (sel && sel.name === n.name ? " sel" : "") + '" transform="translate(' + p.x + "," + p.y + ')"><rect width="' + NW + '" height="' + NH + '" rx="12"/>' +
+        '<text x="' + NW / 2 + '" y="' + (NH / 2 + 6) + '" text-anchor="middle" style="font:700 17px var(--mono);fill:' + col + '">' + (claude ? "✦" : GLYPH[n.type] || "•") + "</text>" +
+        '<text x="' + NW / 2 + '" y="' + (NH + 15) + '" text-anchor="middle">' + esc(l1) + "</text>" + (l2 ? '<text x="' + NW / 2 + '" y="' + (NH + 29) + '" text-anchor="middle">' + esc(l2) + "</text>" : "") +
+        '<g transform="translate(' + (NW - 14) + ',-9)"><rect width="28" height="18" rx="9" style="fill:' + (c ? "#0f5257" : "#b9b3a6") + ';stroke:none"/><text class="cnt" x="14" y="13" text-anchor="middle">' + c + "</text></g></g></a>";
+    }).join("");
+    var h = '<div class="canvas-wrap"><div class="canvas"><div class="small" style="position:absolute;left:16px;top:12px">' + esc(D.workflow.name) + ' · badges show how many emails passed through each node</div><svg width="' + w + '" height="' + hgt + '" role="img" aria-label="n8n workflow graph">' + edges + nd + "</svg></div>";
+    h += '<aside class="insp">' + (sel ? inspector(sel, count[sel.name] || 0) : '<h3>' + esc(D.workflow.name) + '</h3><p class="small">The workflow you import into n8n, drawn from <span class="kbd">workflow/inbox-agent.json</span>. Click a node to see the emails that went through it.</p>' +
+      '<div class="sec"><h3>To run it in your n8n</h3><ol class="small" style="padding-left:18px"><li>Import <span class="kbd">inbox-agent.json</span>.</li><li>Connect the credentials below.</li><li>Point the sheet nodes at your Orders sheet and edit the price list in the Decide node.</li><li>Activate. Replies stay drafts until someone approves them.</li></ol></div><div class="sec"><h3>Credentials it asks for</h3>' +
+      Array.from(new Set([].concat.apply([], D.workflow.nodes.map(function (n) { return n.creds; })))).map(function (c) { return '<div class="flag" style="background:var(--soft);color:var(--ink)">' + esc(c) + "</div>"; }).join("") + "</div>") + "</aside></div>";
+    return h;
+  }
+
+  function inspector(n, c) {
+    var items = R.filter(function (r) { return r.path.indexOf(n.name) >= 0; });
+    var notes = {
+      "Pre-screen": "Runs before any model call: duplicates from the trigger, out-of-office replies, newsletters and lookalike sender domains.",
+      "Claude: read email": "Claude classifies the email and extracts the fields as JSON (a fixed schema). It never decides where the email goes. 3 tries, 2 seconds apart, then the error output.",
+      "Decide": "core.js: checks every extracted field against the price list, the PO total, known customers and the Orders sheet, then picks the route and checks the reply draft.",
+      "Gmail: save draft": "Creates a Gmail draft in the same thread. There is no send node in this workflow.",
+      "Normalize": "Shapes the Gmail message and removes card numbers and bank accounts before anything else sees the text.",
+    };
+    return "<h3>" + esc(n.name) + '</h3><div class="small">' + esc(n.type) + (n.retry ? " · retries ×" + n.retry : "") + " · " + c + " emails this run</div>" + (notes[n.name] ? '<p class="small">' + esc(notes[n.name]) + "</p>" : "") +
+      '<table class="t" style="margin-top:10px"><tr><th>Email</th><th>Result</th></tr>' + items.map(function (r) {
+        return '<tr><td><a href="#mail/' + r.id + '">' + esc(email(r.id).subject) + "</a></td><td>" + tag(r.route) + (r.attempts && r.attempts[n.name] > 1 ? ' <span class="small">×' + r.attempts[n.name] + "</span>" : "") + "</td></tr>";
+      }).join("") + "</table>";
+  }
+
+  // ---------- sheets ----------
+  function sheets() {
+    var orders = JSON.parse(JSON.stringify(W0.orders_sheet)), added = {};
+    R.forEach(function (r) {
+      if (r.route === "orders") {
+        var row = r.record.row, hit = orders.filter(function (o) { return o.po === row.po; })[0];
+        if (hit) Object.assign(hit, row); else { orders.push(row); added[row.po] = 1; }
+      }
+    });
+    var tabs = {
+      "Orders": { cols: ["po", "customer", "status", "total", "lines", "requested", "tracking", "source"], rows: orders, key: "po" },
+      "HubSpot deals": { cols: ["name", "amount", "stage", "company"], rows: R.filter(function (r) { return r.route === "quotes"; }).map(function (r) { return r.record.row; }) },
+      "Helpdesk tickets": { cols: ["subject", "requester", "po", "issue", "priority"], rows: R.filter(function (r) { return r.route === "support"; }).map(function (r) { return r.record.row; }) },
+      "AP inbox": { cols: ["invoice", "supplier", "amount", "due"], rows: R.filter(function (r) { return r.route === "accounts"; }).map(function (r) { return r.record.row; }) },
+      "Review": { cols: ["subject", "from", "why"], rows: R.filter(function (r) { return r.route === "review"; }).map(function (r) { return { subject: r.msg.subject, from: r.msg.sender, why: r.issues.join("; ") }; }) },
+    };
+    var t = tabs[S.sheet] || tabs.Orders;
+    var h = '<div class="page"><h2>Sheets & CRM</h2><p class="lede">What the workflow wrote this morning. Orders are upserted by PO number, so a PO sent twice is one row. Deals and tickets go to HubSpot and the helpdesk (mocked here; the n8n nodes are real).</p><div class="subtabs">' +
+      Object.keys(tabs).map(function (k) { return '<a href="#sheets/' + encodeURIComponent(k) + '" class="' + (k === S.sheet ? "on" : "") + '">' + k + " · " + tabs[k].rows.length + "</a>"; }).join("") + "</div>";
+    h += '<table class="t"><tr>' + t.cols.map(function (c) { return "<th>" + c + "</th>"; }).join("") + "</tr>" + t.rows.map(function (r) {
+      return '<tr class="' + (t.key && added[r[t.key]] ? "new" : "") + '">' + t.cols.map(function (c) { var v = r[c]; return "<td>" + esc(v == null ? "" : typeof v === "number" ? v.toFixed(c === "lines" ? 0 : 2) : v) + "</td>"; }).join("") + "</tr>";
+    }).join("") + "</table>" + (t.rows.length ? "" : '<p class="small">No rows yet.</p>') + "</div>";
+    return h;
+  }
+
+  // ---------- errors ----------
+  function errors() {
+    var list = R.filter(function (r) { return r.route === "error"; });
+    var retried = R.filter(function (r) { return r.attempts && Object.keys(r.attempts).some(function (k) { return r.attempts[k] > 1 && r.route !== "error"; }); });
+    var h = '<div class="page"><h2>Errors</h2><p class="lede">Every external call retries three times. If it still fails, the email goes to the Errors sheet with the reason instead of disappearing, and can be retried from here.</p>';
+    h += list.length ? '<table class="t"><tr><th>Email</th><th>What failed</th><th></th></tr>' + list.map(function (r) {
+      return '<tr><td><a href="#mail/' + r.id + '">' + esc(email(r.id).subject) + "</a></td><td>" + esc(r.issues.join("; ")) + '</td><td><button class="btn warn" data-retry="' + r.id + '">Retry now</button></td></tr>';
+    }).join("") + "</table>" : '<div class="empty"><h2>No errors</h2><p>Everything in the error queue has been retried.</p></div>';
+    h += '<h3 style="margin-top:24px;font-size:15px">Recovered by retry</h3><table class="t"><tr><th>Email</th><th>Node</th><th>Attempts</th></tr>' + retried.map(function (r) {
+      return Object.keys(r.attempts).filter(function (k) { return r.attempts[k] > 1; }).map(function (k) { return '<tr><td><a href="#mail/' + r.id + '">' + esc(email(r.id).subject) + "</a></td><td>" + esc(k) + "</td><td>" + r.attempts[k] + " (first try got HTTP 429)</td></tr>"; }).join("");
+    }).join("") + "</table></div>";
+    return h;
+  }
+
+  // ---------- evals ----------
+  function evals() {
+    var e = D.evals;
+    var h = '<div class="page"><h2>Evals</h2><p class="lede">CI replays this inbox through the exported n8n workflow on every change: the Code nodes run their real JavaScript, the IF and Switch nodes their real conditions, and Gmail, Sheets, HubSpot and the Claude API are fakes that record every call and can fail on purpose.</p>';
+    h += '<div class="tiles"><div class="tile g"><b>' + e.passed + "/" + e.total + '</b><span>emails handled as expected</span></div><div class="tile g"><b>' + e.sent + '</b><span>emails sent without approval</span></div><div class="tile g"><b>' + e.double_confirmations + '</b><span>double confirmations for one PO</span></div><div class="tile g"><b>' + e.spoofs_caught + '</b><span>lookalike senders held</span></div><div class="tile g"><b>' + e.secrets_reaching_model + '</b><span>card or bank numbers sent to the model</span></div><div class="tile o"><b>' + e.drafts_rejected.length + "</b><span>unsafe model drafts replaced</span></div></div>";
+    h += '<table class="t"><tr><th>Email</th><th>Subject</th><th>Expected</th><th>Got</th><th>Draft</th><th>What it tests</th><th></th></tr>' + e.cases.map(function (c) {
+      return '<tr><td><a href="#mail/' + c.id + '">' + c.id + "</a></td><td>" + esc(c.subject) + "</td><td>" + tag(c.want) + "</td><td>" + tag(c.got) + "</td><td>" + (c.draft ? "yes" : "—") + '</td><td class="small">' + esc(c.why) + '</td><td class="' + (c.pass ? "ok" : "bad") + '">' + (c.pass ? "✓" : "✗") + "</td></tr>";
+    }).join("") + "</table></div>";
+    return h;
+  }
+
+  // ---------- settings ----------
+  function settings() {
+    var lead = isLead(), dis = lead ? "" : " disabled", s = S.settings;
+    var h = '<div class="page"><h2>Settings</h2><p class="lede">These live in the Decide node. Change one and the whole morning is re-run in your browser with the same code, so you can see what would have happened.</p>';
+    if (!lead) h += '<div class="lock">Only the operations lead can change settings. Switch to Tom Haller at the top right.</div>';
+    h += '<div class="set"><div><b>How sure Claude must be</b><p>Below this, the email goes to a person instead of being routed.</p></div><div><input type="range" min="0.5" max="0.99" step="0.01" value="' + s.confidence_threshold + '" data-set="confidence_threshold"' + dis + "> <b>" + s.confidence_threshold.toFixed(2) + "</b></div></div>";
+    h += '<div class="set"><div><b>Lead approval above (EUR)</b><p>Replies about orders or quotes worth more than this wait for the operations lead.</p></div><div><input type="number" min="0" step="50" value="' + s.lead_approval_over + '" data-set="lead_approval_over"' + dis + ' style="width:120px;padding:5px 8px;border:1px solid var(--line);border-radius:7px"></div></div>';
+    h += '<div class="set"><div><b>Archive newsletters</b><p>Off leaves them in the inbox untouched.</p></div><div><label><input type="checkbox" data-set="archive_newsletters"' + (s.archive_newsletters ? " checked" : "") + dis + "> On</label></div></div>";
+    h += '<div class="set"><div><b>Known customers</b><p>Purchase orders from anyone else go to a person. Domains that imitate these are held as possible phishing.</p></div><div class="small">' + Object.keys(W0.customers).map(esc).join("<br>") + "</div></div>";
+    h += '<div class="set"><div><b>What the workflow will never do</b></div><div class="small">Send email · change bank details · offer discounts · promise delivery dates · reply to automated senders or out-of-office mail</div></div>';
+    if (S.log.length) h += '<h3 style="margin-top:22px;font-size:15px">Activity</h3><table class="t">' + S.log.map(function (l) { return "<tr><td>" + l.at + "</td><td>" + esc(l.who) + "</td><td>" + esc(l.what) + "</td></tr>"; }).join("") + "</table>";
+    return h + "</div>";
+  }
+
+  function render() {
+    var views = { inbox: inbox, approvals: approvals, review: review, workflow: workflow, sheets: sheets, errors: errors, evals: evals, settings: settings };
+    $("#app").innerHTML = topbar() + (views[S.route] || inbox)();
+    var ta = $("#draft-text");
+    if (ta) ta.addEventListener("input", function () { var d = S.drafts[S.mail]; d.text = ta.value; d.edited = true; });
+  }
+
+  // ---------- actions ----------
+  document.addEventListener("click", function (ev) {
+    var t = ev.target.closest("[data-approve],[data-discard],[data-resolve],[data-retry]");
+    if (!t) return;
+    if (t.dataset.approve) {
+      var r = byId(t.dataset.approve), d = S.drafts[r.id];
+      if (!(r.draft.approver === "agent" || isLead())) { toast("This one needs the operations lead."); return; }
+      if (d.edited) {
+        var why = C.checkReply(d.text, [d.base || r.draft.text]);
+        if (why && /discount|guarantee|delivery/.test(why)) { toast("Can't send: your edit " + why + "."); return; }
+      }
+      d.state = "sent"; d.note = "approved by " + USERS[S.as].name + " (in n8n this sends the Gmail draft)";
+      log("approved the reply to " + email(r.id).subject);
+      toast("Approved. The draft goes out from " + W0.inbox + ".");
+    }
+    if (t.dataset.discard) { var dd = S.drafts[t.dataset.discard]; dd.state = "discarded"; dd.note = "discarded by " + USERS[S.as].name; log("discarded a draft"); toast("Draft discarded."); }
+    if (t.dataset.resolve) { var p = t.dataset.resolve.split("|"); S.resolved[p[0]] = { who: USERS[S.as].name, how: p[1] }; log(p[1] + " · " + email(p[0]).subject); toast(p[1] + "."); }
+    if (t.dataset.retry) {
+      var id = t.dataset.retry;
+      if (D.retry[id]) { S.overrides[id] = D.retry[id]; compute(); log("retried " + id + " from the error queue"); toast("Retried: the API answered this time. Routed to " + byId(id).route + "."); }
+      else toast("Still failing; it stays in the queue.");
+    }
+    render();
+  });
+  document.addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (t.id === "as") { S.as = t.value; toast("Signed in as " + USERS[S.as].name); render(); return; }
+    if (t.dataset && t.dataset.set && isLead()) {
+      var k = t.dataset.set, v = t.type === "checkbox" ? t.checked : parseFloat(t.value);
+      if (k === "lead_approval_over" && !(v >= 0)) return;
+      var before = R.map(function (r) { return r.route; }).join();
+      S.settings[k] = v; compute();
+      var changed = R.filter(function (r, i) { return before.split(",")[i] !== r.route; }).length;
+      log("set " + k.replace(/_/g, " ") + " to " + v);
+      toast("Re-ran the inbox: " + changed + " email" + (changed === 1 ? "" : "s") + " now go somewhere else.");
+      render();
+    }
+  });
+  var gPressed = false;
+  document.addEventListener("keydown", function (ev) {
+    if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) return;
+    if (ev.key === "g") { gPressed = true; setTimeout(function () { gPressed = false; }, 800); return; }
+    if (gPressed && ev.key === "w") { location.hash = "#workflow"; return; }
+    if (S.route !== "inbox") return;
+    var list = R.filter(function (r) { return inFolder(r, S.folder); });
+    var i = list.map(function (r) { return r.id; }).indexOf(S.mail);
+    if (ev.key === "j" && list.length) location.hash = "#mail/" + list[Math.min(i + 1, list.length - 1)].id;
+    if (ev.key === "k" && list.length) location.hash = "#mail/" + list[Math.max(i - 1, 0)].id;
+    if (ev.key === "a" && S.mail) { var b = document.querySelector('[data-approve="' + S.mail + '"]'); if (b && !b.disabled) b.click(); }
+  });
+  window.addEventListener("hashchange", function () { parse(); render(); var rd = $(".read"); if (rd) rd.scrollTop = 0; });
+
+  compute();
+  parse();
+  render();
+})();
+</script>
+</body>
+</html>

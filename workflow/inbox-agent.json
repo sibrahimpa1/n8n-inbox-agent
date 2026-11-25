@@ -128,7 +128,7 @@
       "typeVersion": 2.1,
       "position": [
         1100,
-        520
+        560
       ],
       "parameters": {
         "operation": "addLabels",
@@ -423,7 +423,7 @@
       "typeVersion": 2.1,
       "position": [
         1780,
-        140
+        190
       ],
       "parameters": {
         "resource": "deal",
@@ -451,7 +451,7 @@
       "typeVersion": 4.2,
       "position": [
         1780,
-        280
+        380
       ],
       "parameters": {
         "method": "POST",
@@ -471,7 +471,7 @@
       "typeVersion": 4.5,
       "position": [
         1780,
-        560
+        580
       ],
       "parameters": {
         "operation": "append",
@@ -509,7 +509,7 @@
       "typeVersion": 4.5,
       "position": [
         1780,
-        700
+        770
       ],
       "parameters": {
         "operation": "append",
@@ -547,7 +547,7 @@
       "typeVersion": 4.5,
       "position": [
         1780,
-        860
+        960
       ],
       "parameters": {
         "operation": "append",
@@ -583,7 +583,7 @@
       "typeVersion": 2.2,
       "position": [
         2020,
-        200
+        190
       ],
       "parameters": {
         "conditions": {
@@ -612,7 +612,7 @@
       "typeVersion": 2.1,
       "position": [
         2240,
-        200
+        190
       ],
       "parameters": {
         "resource": "draft",
